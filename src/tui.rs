@@ -410,7 +410,15 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
                 .block(
                     Block::default().title(
                         Line::from(format!(
-                            "TRANSCRIPT · {} words",
+                            "{} recorded · {} words",
+                            timestamp(
+                                state
+                                    .chunks
+                                    .iter()
+                                    .filter(|chunk| chunk.tab_id == state.selected_tab)
+                                    .map(|chunk| chunk.seconds)
+                                    .sum()
+                            ),
                             transcript.split_whitespace().count()
                         ))
                         .fg(MUTED),
