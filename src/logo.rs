@@ -24,6 +24,50 @@ pub fn gradient(index: usize, count: usize) -> ratatui::style::Color {
     )
 }
 
+/// Staggered row arrival followed by a single diagonal glint, then the exact static logo.
+pub fn reveal(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, elapsed: f32) {
+    use ratatui::style::Color;
+    let elapsed = if std::env::var_os("PASTEFACE_REDUCED_MOTION").is_some() {
+        2.
+    } else {
+        elapsed
+    };
+    let width = ANSI_FACE[0].chars().count() as i32;
+    let left = area.x as i32 + (area.width as i32 - width) / 2;
+    for (row, line) in ANSI_FACE.iter().enumerate() {
+        let progress = ((elapsed - row as f32 * 0.035) / 0.65).clamp(0., 1.);
+        let ease = 1. - (1. - progress).powi(3);
+        let shift = ((1. - ease) * 8.).round() as i32 * if row % 2 == 0 { -1 } else { 1 };
+        let Color::Rgb(r, g, b) = gradient(row, ANSI_FACE.len()) else {
+            continue;
+        };
+        for (column, symbol) in line.chars().enumerate().filter(|(_, c)| *c != ' ') {
+            let x = left + column as i32 + shift;
+            let y = area.y + row as u16;
+            if x < area.x as i32 || x >= area.right() as i32 || y >= area.bottom() {
+                continue;
+            }
+            let position = column as f32 * 0.05 + row as f32 * 0.09;
+            let glint = if (0.7..2.).contains(&elapsed) {
+                (1. - (position - (elapsed - 0.7) * 2.8).abs() / 0.3).max(0.) * 0.55
+            } else {
+                0.
+            };
+            let channel = |base: u8, background: f32| {
+                (background + ((base as f32 + (255. - base as f32) * glint) - background) * ease)
+                    as u8
+            };
+            frame.buffer_mut()[(x as u16, y)]
+                .set_char(symbol)
+                .set_fg(Color::Rgb(
+                    channel(r, 18.),
+                    channel(g, 23.),
+                    channel(b, 30.),
+                ));
+        }
+    }
+}
+
 /// A small status circle, independent of the terminal logo.
 #[cfg(feature = "tray")]
 pub fn rgba(size: usize, phase: Phase) -> Vec<u8> {

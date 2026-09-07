@@ -65,6 +65,7 @@ struct View {
     confirm: bool,
     microphone: Option<usize>,
     levels: VecDeque<u64>,
+    welcome_started: Option<Instant>,
 }
 
 fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<()> {
@@ -72,6 +73,11 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
     let mut sampled_at = Instant::now();
     loop {
         let (state, error) = client.snapshot();
+        if state.transcript.is_empty() && !state.phase.busy() {
+            view.welcome_started.get_or_insert_with(Instant::now);
+        } else {
+            view.welcome_started = None;
+        }
         let copies = client.copies();
         if copies != view.copies {
             view.copies = copies;
@@ -95,7 +101,10 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
             .position(|tab| tab.id == state.selected_tab)
             .unwrap_or(0);
         terminal.draw(|f| draw(f, &state, error.as_deref(), &mut view))?;
-        if event::poll(Duration::from_millis(80))? {
+        let revealing = view
+            .welcome_started
+            .is_some_and(|start| start.elapsed() < Duration::from_secs(2));
+        if event::poll(Duration::from_millis(if revealing { 32 } else { 80 }))? {
             let event = event::read()?;
             if let Some(menu) = &mut view.tab_menu {
                 let (close, action) = menu.event(event, terminal.get_frame().area());
@@ -391,7 +400,12 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     transcript_tabs(frame, state, view, rows[0]);
     let transcript = state.transcript.as_str();
     if transcript.is_empty() && !state.phase.busy() {
-        welcome(frame, rows[1]);
+        welcome(
+            frame,
+            rows[1],
+            view.welcome_started
+                .map_or(2., |start| start.elapsed().as_secs_f32()),
+        );
     } else {
         let text = if transcript.is_empty() {
             "Your words will appear here after you stop recording."
@@ -844,16 +858,9 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
     }
 }
 
-fn welcome(frame: &mut ratatui::Frame, area: Rect) {
+fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32) {
     let mut lines = if area.height as usize >= logo::ANSI_FACE.len() + 3 {
-        logo::ANSI_FACE
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let tint = logo::gradient(i, logo::ANSI_FACE.len());
-                Line::from(*line).fg(tint).centered()
-            })
-            .collect::<Vec<_>>()
+        vec![Line::from(""); logo::ANSI_FACE.len()]
     } else {
         vec![Line::from("◉  pasteface").fg(MINT).bold().centered()]
     };
@@ -876,6 +883,13 @@ fn welcome(frame: &mut ratatui::Frame, area: Rect) {
         Paragraph::new(lines),
         Rect::new(area.x, top, area.width, height.min(area.height)),
     );
+    if area.height as usize >= logo::ANSI_FACE.len() + 3 {
+        logo::reveal(
+            frame,
+            Rect::new(area.x, top, area.width, logo::ANSI_FACE.len() as u16),
+            elapsed,
+        );
+    }
 }
 fn microphone_index(state: &State) -> usize {
     state
