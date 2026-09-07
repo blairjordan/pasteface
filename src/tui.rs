@@ -18,7 +18,7 @@ use ratatui::{
     widgets::{Bar, BarChart, BarGroup, Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
 const BG: Color = Color::Rgb(18, 23, 30);
@@ -67,6 +67,46 @@ struct View {
     microphone: Option<usize>,
     levels: VecDeque<u64>,
     welcome_started: Option<Instant>,
+    completed: HashMap<String, Instant>,
+}
+
+fn queue_items(
+    state: &State,
+    completed: &mut HashMap<String, Instant>,
+    now: Instant,
+) -> Vec<(usize, f32)> {
+    completed.retain(|id, _| {
+        state
+            .chunks
+            .iter()
+            .any(|c| c.id == *id && c.status == ChunkStatus::Ready)
+    });
+    state
+        .chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            let opacity = if chunk.status == ChunkStatus::Ready {
+                let elapsed = now
+                    .duration_since(*completed.entry(chunk.id.clone()).or_insert(now))
+                    .as_secs_f32();
+                (1. - (elapsed - 3.5) / 0.5).clamp(0., 1.)
+            } else {
+                1.
+            };
+            (opacity > 0.).then_some((index, opacity))
+        })
+        .collect()
+}
+
+fn fade(color: Color, opacity: f32) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    let blend = |value: u8, background: u8| {
+        (background as f32 + (value as f32 - background as f32) * opacity) as u8
+    };
+    Color::Rgb(blend(r, 18), blend(g, 23), blend(b, 30))
 }
 
 fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<()> {
@@ -387,6 +427,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         return;
     }
     let shortcuts = shortcuts(frame.area().width.saturating_sub(2));
+    let queue_items = queue_items(state, &mut view.completed, Instant::now());
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
@@ -395,7 +436,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         } else {
             4
         }),
-        Constraint::Length(if state.chunks.is_empty() { 0 } else { 2 }),
+        Constraint::Length(if queue_items.is_empty() { 0 } else { 2 }),
         Constraint::Length(1),
         Constraint::Length(shortcuts.len() as u16),
     ])
@@ -664,7 +705,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         }
     }
     frame.render_widget(Paragraph::new(shortcuts).fg(MINT), rows[5]);
-    queue(frame, state, rows[3], &mut view.hits);
+    queue(frame, state, rows[3], &mut view.hits, &queue_items);
     if let Some(settings) = &view.settings {
         settings.draw(frame, &state.device);
     }
@@ -794,14 +835,19 @@ fn shortcuts(width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
-    if area.height < 2 || state.chunks.is_empty() {
+fn queue(
+    frame: &mut ratatui::Frame,
+    state: &State,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+    items: &[(usize, f32)],
+) {
+    if area.height < 2 || items.is_empty() {
         return;
     }
-    let done = state
-        .chunks
+    let done = items
         .iter()
-        .filter(|c| c.status == ChunkStatus::Ready)
+        .filter(|(index, _)| state.chunks[*index].status == ChunkStatus::Ready)
         .count();
     frame.render_widget(
         Paragraph::new(format!(
@@ -814,7 +860,7 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
         Rect::new(area.x, area.y, area.width, 1),
     );
     // Always show current work before old completed chunks; summarize overflow.
-    let mut indices = (0..state.chunks.len()).collect::<Vec<_>>();
+    let mut indices = items.iter().map(|(index, _)| *index).collect::<Vec<_>>();
     indices.sort_by_key(|i| match state.chunks[*i].status {
         ChunkStatus::Recording => (0, *i),
         ChunkStatus::Transcribing => (1, *i),
@@ -835,7 +881,15 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
         };
         Span::styled(
             format!("{:02} {label} {}", index + 1, timestamp(chunk.seconds)),
-            Style::default().fg(color).bg(Color::Rgb(32, 41, 51)),
+            {
+                let opacity = items
+                    .iter()
+                    .find(|(i, _)| *i == index)
+                    .map_or(1., |(_, opacity)| *opacity);
+                Style::default()
+                    .fg(fade(color, opacity))
+                    .bg(fade(Color::Rgb(32, 41, 51), opacity))
+            },
         )
     };
     let mut remaining = area.width as usize;
@@ -847,7 +901,7 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
         remaining = remaining.saturating_sub(width + 1);
         true
     });
-    let overflow = state.chunks.len() - indices.len();
+    let overflow = items.len() - indices.len();
     indices.sort_unstable();
     let mut spans = Vec::new();
     let mut x = area.x;
@@ -970,6 +1024,43 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     #[test]
+    fn completed_queue_items_fade_without_removing_transcripts() {
+        let mut state = State::default();
+        state.chunks.push(crate::model::Chunk {
+            id: "chunk".into(),
+            tab_id: "default".into(),
+            title: String::new(),
+            status: ChunkStatus::Ready,
+            text: "Keep this transcript".into(),
+            error: None,
+            seconds: 10.,
+        });
+        let mut completed = HashMap::new();
+        let now = Instant::now();
+        assert_eq!(queue_items(&state, &mut completed, now), vec![(0, 1.)]);
+        assert_eq!(
+            queue_items(&state, &mut completed, now + Duration::from_millis(3500)),
+            vec![(0, 1.)]
+        );
+        assert_eq!(
+            queue_items(&state, &mut completed, now + Duration::from_millis(3750)),
+            vec![(0, 0.5)]
+        );
+        assert!(queue_items(&state, &mut completed, now + Duration::from_secs(4)).is_empty());
+        assert_eq!(state.chunks[0].text, "Keep this transcript");
+        state.chunks[0].status = ChunkStatus::Queued;
+        assert_eq!(
+            queue_items(&state, &mut completed, now + Duration::from_secs(5)),
+            vec![(0, 1.)]
+        );
+        state.chunks[0].status = ChunkStatus::Ready;
+        assert_eq!(
+            queue_items(&state, &mut completed, now + Duration::from_secs(6)),
+            vec![(0, 1.)]
+        );
+        assert_eq!(fade(MINT, 0.), BG);
+    }
+    #[test]
     fn queue_chips_fit_two_rows_with_duration_and_cancellation() {
         let mut state = State::default();
         for status in [
@@ -989,7 +1080,15 @@ mod tests {
         }
         let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
         terminal
-            .draw(|f| queue(f, &state, f.area(), &mut Vec::new()))
+            .draw(|f| {
+                queue(
+                    f,
+                    &state,
+                    f.area(),
+                    &mut Vec::new(),
+                    &[(0, 1.), (1, 1.), (2, 1.)],
+                )
+            })
             .unwrap();
         let text: String = terminal
             .backend()
