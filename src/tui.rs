@@ -288,6 +288,10 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                 continue;
             }
             let action = match key.code {
+                KeyCode::Char('e') if !state.tabs.is_empty() => {
+                    view.tab_menu = Some(TabMenu::export(&state, view.tab));
+                    None
+                }
                 KeyCode::Char('t') => Some(Action::ReopenTab),
                 KeyCode::Char('+') => {
                     view.tab_menu = Some(TabMenu::create());
@@ -603,7 +607,10 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         "Clear this tab and its audio? [X] confirm · [Esc] dismiss"
     } else {
         error.unwrap_or(
-            if copied || state.phase.busy() || state.message == "Copied to clipboard." {
+            if copied
+                || (state.phase.busy() && !state.message.starts_with("Exported to "))
+                || state.message == "Copied to clipboard."
+            {
                 ""
             } else {
                 &state.message
@@ -746,6 +753,7 @@ fn shortcut_controls() -> Vec<(&'static str, KeyEvent)> {
         ("[Space] record/stop", KeyCode::Char(' ')),
         ("[C] copy", KeyCode::Char('c')),
         ("[Ctrl+C] latest", KeyCode::Char('c')),
+        ("[E] export", KeyCode::Char('e')),
         ("[X] clear", KeyCode::Char('x')),
         ("[S] settings", KeyCode::Char('s')),
         ("[↑↓] scroll", KeyCode::Down),

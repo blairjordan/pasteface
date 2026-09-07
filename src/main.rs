@@ -1,6 +1,7 @@
 mod animation;
 mod audio;
 mod config;
+mod export;
 
 mod ipc;
 mod logo;

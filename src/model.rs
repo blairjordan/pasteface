@@ -159,6 +159,10 @@ pub enum Action {
     CopyLatest,
     CopyChunk(String),
     CopyText(String),
+    ExportTab {
+        id: String,
+        path: std::path::PathBuf,
+    },
     CreateTab(String),
     SelectTab(String),
     CloseTab(String),

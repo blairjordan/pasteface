@@ -470,6 +470,28 @@ impl Recorder {
             }
             Action::Copy => self.copy()?,
             Action::CopyText(text) => self.copy_text(text)?,
+            Action::ExportTab { id, path } => {
+                let tab = self
+                    .state
+                    .tabs
+                    .iter()
+                    .chain(&self.state.closed_tabs)
+                    .find(|tab| tab.id == id)
+                    .context("Tab is no longer available.")?;
+                let text = std::iter::once(tab.prior_transcript.as_str())
+                    .chain(
+                        self.state
+                            .chunks
+                            .iter()
+                            .filter(|chunk| chunk.tab_id == id)
+                            .map(|chunk| chunk.text.as_str()),
+                    )
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                crate::export::write(&path, &text)?;
+                self.state.message = format!("Exported to {}", path.display());
+            }
             Action::CreateTab(name) => {
                 validate_tab_name(&name)?;
                 let id = format!(
@@ -894,6 +916,28 @@ mod tests {
         restored.action(Action::ReopenTab).unwrap();
         assert_eq!(restored.state.transcript, "Keep these words");
         assert_eq!(restored.state.selected_tab, "default");
+    }
+    #[test]
+    fn export_uses_requested_tab_without_changing_active_tab() {
+        let (_temp, mut recorder) = setup();
+        let first = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[first].text = "First tab text".into();
+        recorder
+            .action(Action::CreateTab("Another".into()))
+            .unwrap();
+        let second = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[second].text = "Other tab text".into();
+        let selected = recorder.state.selected_tab.clone();
+        let path = recorder.config.directory.join("export.txt");
+        recorder
+            .action(Action::ExportTab {
+                id: "default".into(),
+                path: path.clone(),
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "First tab text\n");
+        assert_eq!(recorder.state.selected_tab, selected);
+        assert_eq!(recorder.state.chunks[second].text, "Other tab text");
     }
     #[test]
     fn lock_prevents_two_recorders() {

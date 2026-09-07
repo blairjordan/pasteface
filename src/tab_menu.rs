@@ -7,11 +7,19 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph},
 };
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Menu,
+    Name,
+    Export,
+}
+
 pub struct TabMenu {
     id: Option<String>,
     name: String,
     position: (u16, u16),
-    renaming: bool,
+    mode: Mode,
+    error: Option<String>,
     replace: bool,
     menu_index: usize,
 }
@@ -21,7 +29,8 @@ impl TabMenu {
             id: state.tabs.get(tab).map(|t| t.id.clone()),
             name: title(state, tab),
             position,
-            renaming,
+            mode: if renaming { Mode::Name } else { Mode::Menu },
+            error: None,
             replace: true,
             menu_index: 0,
         }
@@ -31,13 +40,14 @@ impl TabMenu {
             id: None,
             name: String::new(),
             position: (0, 0),
-            renaming: true,
+            mode: Mode::Name,
+            error: None,
             replace: false,
             menu_index: 0,
         }
     }
     fn area(&self, screen: Rect) -> Rect {
-        if self.renaming {
+        if self.mode != Mode::Menu {
             let width = screen.width.saturating_sub(2).min(60);
             Rect::new(
                 screen.x + (screen.width - width) / 2,
@@ -49,23 +59,43 @@ impl TabMenu {
             let width = 18.min(screen.width);
             Rect::new(
                 self.position.0.min(screen.right().saturating_sub(width)),
-                self.position.1.min(screen.bottom().saturating_sub(4)),
+                self.position.1.min(screen.bottom().saturating_sub(5)),
                 width,
-                4.min(screen.height),
+                5.min(screen.height),
             )
         }
     }
+    pub fn export(state: &State, tab: usize) -> Self {
+        let mut dialog = Self::new(state, tab, (0, 0), false);
+        dialog.begin_export();
+        dialog
+    }
+    fn begin_export(&mut self) {
+        self.mode = Mode::Export;
+        self.name = crate::export::suggested_path(&self.name);
+        self.replace = true;
+    }
     fn choose(&mut self) -> (bool, Option<Action>) {
-        if self.menu_index == 1 {
-            return (true, self.id.clone().map(Action::CloseTab));
+        match self.menu_index {
+            1 => self.begin_export(),
+            2 => return (true, self.id.clone().map(Action::CloseTab)),
+            _ => self.mode = Mode::Name,
         }
-        self.renaming = true;
         (false, None)
     }
-    fn save(&self) -> Option<Action> {
+    fn save(&mut self) -> Option<Action> {
         let name = self.name.trim();
         if name.is_empty() {
             return None;
+        }
+        if self.mode == Mode::Export {
+            return match crate::export::resolve_path(name) {
+                Ok(path) => self.id.clone().map(|id| Action::ExportTab { id, path }),
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    None
+                }
+            };
         }
         Some(match &self.id {
             Some(id) => Action::RenameTab {
@@ -81,7 +111,7 @@ impl TabMenu {
             self.replace = false;
         }
         for c in text.chars().filter(|c| !c.is_control()) {
-            if self.name.chars().count() >= 48 {
+            if self.name.chars().count() >= if self.mode == Mode::Export { 2048 } else { 48 } {
                 break;
             }
             self.name.push(c);
@@ -91,14 +121,18 @@ impl TabMenu {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => return (true, None),
-                KeyCode::Enter if self.renaming => {
+                KeyCode::Enter if self.mode != Mode::Menu => {
                     let action = self.save();
                     return (action.is_some(), action);
                 }
                 KeyCode::Enter => return self.choose(),
-                KeyCode::Up if !self.renaming => self.menu_index = 0,
-                KeyCode::Down if !self.renaming => self.menu_index = 1,
-                KeyCode::Backspace if self.renaming => {
+                KeyCode::Up if self.mode == Mode::Menu => {
+                    self.menu_index = self.menu_index.saturating_sub(1)
+                }
+                KeyCode::Down if self.mode == Mode::Menu => {
+                    self.menu_index = (self.menu_index + 1).min(2)
+                }
+                KeyCode::Backspace if self.mode != Mode::Menu => {
                     if self.replace {
                         self.name.clear();
                         self.replace = false;
@@ -107,13 +141,13 @@ impl TabMenu {
                     }
                 }
                 KeyCode::Char('u' | 'c')
-                    if self.renaming && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    if self.mode != Mode::Menu && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     self.name.clear();
                     self.replace = false;
                 }
                 KeyCode::Char(c)
-                    if self.renaming
+                    if self.mode != Mode::Menu
                         && !key
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -122,13 +156,13 @@ impl TabMenu {
                 }
                 _ => {}
             },
-            Event::Paste(text) if self.renaming => self.insert(&text),
+            Event::Paste(text) if self.mode != Mode::Menu => self.insert(&text),
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 let area = self.area(screen);
                 if !area.contains((mouse.column, mouse.row).into()) {
                     return (true, None);
                 }
-                if !self.renaming {
+                if self.mode == Mode::Menu {
                     if mouse.row > area.y && mouse.row < area.bottom() - 1 {
                         self.menu_index = (mouse.row - area.y - 1) as usize;
                         return self.choose();
@@ -157,23 +191,30 @@ impl TabMenu {
             .bg(Color::Rgb(18, 23, 30))
             .fg(Color::Rgb(185, 239, 214));
         let block = Block::bordered().style(style);
-        if self.renaming {
+        if self.mode != Mode::Menu {
+            let visible = self
+                .name
+                .chars()
+                .rev()
+                .take(area.width.saturating_sub(3) as usize)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>();
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(if self.id.is_some() {
+                    Line::from(if self.mode == Mode::Export {
+                        "export transcript · .txt"
+                    } else if self.id.is_some() {
                         "rename tab"
                     } else {
                         "new tab"
                     })
                     .bold(),
                     Line::from(""),
-                    Line::from(if self.name.is_empty() {
-                        " "
-                    } else {
-                        &self.name
-                    })
-                    .bg(Color::Rgb(38, 43, 64)),
-                    Line::from(""),
+                    Line::from(if self.name.is_empty() { " " } else { &visible })
+                        .bg(Color::Rgb(38, 43, 64)),
+                    Line::from(self.error.as_deref().unwrap_or("")),
                     Line::from(vec![
                         ratatui::text::Span::styled(
                             " ↵ save ",
@@ -193,7 +234,7 @@ impl TabMenu {
                 area.y + 3,
             ));
         } else {
-            let lines = ["Rename…", "Close tab"]
+            let lines = ["Rename…", "Export…", "Close tab"]
                 .iter()
                 .enumerate()
                 .map(|(i, label)| {

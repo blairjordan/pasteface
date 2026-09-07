@@ -70,6 +70,7 @@ Run `pasteface` to open the terminal interface and start the tray companion.
 | --- | --- |
 | **Space** | Start or stop recording; stopping enqueues the chunk |
 | **C** | Copy the selected tab’s transcript |
+| **E** | Export the selected tab to a .txt file |
 | **Ctrl+C** | Copy only the latest completed chunk |
 | **X** | Clear the selected tab’s recordings and transcript after confirmation |
 | **S** | Open settings, including microphone selection |
@@ -83,6 +84,8 @@ Run `pasteface` to open the terminal interface and start the tray companion.
 Click **+** to create a named transcript tab. New recordings append to the selected tab; recording a chunk never creates a tab. Click a tab to switch transcripts, or click a queue block to open its owning tab. Tabs also support **[ / ]** navigation. Right-click a tab and choose **Rename**, or press **F2**, to give it a persistent name. **Close tab** in the same menu hides the tab while retaining its transcript and audio. Use **Reopen** beside **+** to restore closed tabs.
 
 Click the footer controls to record, copy, clear, cancel, or open settings. Settings and the microphone picker support clicks and the mouse wheel. Scroll over the transcript with the wheel. Drag across transcript text to highlight and copy it; hold **Shift** while dragging to use native terminal selection instead.
+
+Press **E**, or right-click a tab and choose **Export…**, to save its completed transcript as plain UTF-8 text. Edit the suggested path and press **Enter** to save. Relative paths use the terminal’s working directory; ~/ is supported. Existing files are never overwritten.
 
 The microphone meter responds to your voice while recording. Queue blocks show each chunk's duration and whether it is queued, transcribing, completed, failed, or canceled.
 
