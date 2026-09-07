@@ -367,10 +367,10 @@ impl Recorder {
             }
             Action::Start => {
                 ensure!(self.capture.is_none(), "Already recording.");
-                ensure!(
-                    !self.state.selected_tab.is_empty(),
-                    "Create or reopen a tab before recording."
-                );
+                if self.state.tabs.is_empty() {
+                    let number = self.state.closed_tabs.len() + 1;
+                    self.action(Action::CreateTab(format!("Transcript {number}")))?;
+                }
                 self.config.check_model()?;
                 let index = self.add_chunk(ChunkStatus::Recording)?;
                 match Capture::start(
@@ -761,6 +761,27 @@ mod tests {
         assert!(error.contains("Whisper executable missing"));
         assert!(r.action(Action::Clear).is_err());
         assert!(r.action(Action::Shutdown).is_err());
+    }
+    #[test]
+    fn recording_creates_a_tab_when_all_tabs_are_closed() {
+        let (_temp, mut recorder) = setup();
+        let index = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[index].text = "Saved words".into();
+        recorder.action(Action::CloseTab("default".into())).unwrap();
+
+        // Missing test backend prevents microphone access after tab creation.
+        for _ in 0..2 {
+            let error = recorder.action(Action::Toggle).unwrap_err().to_string();
+            assert!(error.contains("Whisper executable missing"));
+            assert_eq!(recorder.state.tabs.len(), 1);
+            assert_eq!(recorder.state.selected_tab, recorder.state.tabs[0].id);
+            assert_ne!(recorder.state.selected_tab, "default");
+            assert!(recorder.state.transcript.is_empty());
+        }
+        let restored = Recorder::new(recorder.config.clone()).unwrap();
+        assert_eq!(restored.state.tabs.len(), 1);
+        assert_eq!(restored.state.closed_tabs[0].id, "default");
+        assert_eq!(restored.state.chunks[index].text, "Saved words");
     }
     #[test]
     fn restart_requeues_worker_and_retains_failed_capture() {

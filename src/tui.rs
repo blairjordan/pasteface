@@ -416,7 +416,6 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             rows[1],
             view.welcome_started
                 .map_or(2., |start| start.elapsed().as_secs_f32()),
-            !state.tabs.is_empty(),
         );
     } else {
         let text = if transcript.is_empty() {
@@ -881,7 +880,7 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
     }
 }
 
-fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32, has_tabs: bool) {
+fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32) {
     let mut lines = if area.height as usize >= logo::ANSI_FACE.len() + 3 {
         vec![Line::from(""); logo::ANSI_FACE.len()]
     } else {
@@ -895,15 +894,7 @@ fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32, has_tabs: bool)
         ])
         .centered(),
     );
-    lines.push(
-        Line::from(if has_tabs {
-            "Press Space. Let the words come."
-        } else {
-            "Create a tab with + to start recording."
-        })
-        .fg(MUTED)
-        .centered(),
-    );
+    lines.push(Line::from("Press Space to record.").fg(MUTED).centered());
     let height = lines.len() as u16;
     let top = area.y + area.height.saturating_sub(height) / 2;
     frame.render_widget(
