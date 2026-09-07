@@ -33,7 +33,7 @@ struct Cli {
 enum Command {
     /// Start with only the application's tray icon visible.
     Tray,
-    /// Open the Ratatui terminal interface.
+    /// Open the recording interface.
     Tui {
         /// Do not start the tray companion.
         #[arg(long)]

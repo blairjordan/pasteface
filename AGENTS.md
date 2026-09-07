@@ -4,7 +4,7 @@ Read this file before changing Pasteface. It applies to Codex, Claude, and other
 
 ## Product
 
-Pasteface is a Rust/Ratatui terminal application for recording and transcribing speech on Linux and macOS. Keep the interface compact, dark by default, and usable with both keyboard and mouse. Keep transcript text free of decorative side borders so terminal selection stays useful.
+Pasteface records and transcribes speech from the terminal on Linux and macOS. Keep the interface compact and usable with both keyboard and mouse. Keep transcript text free of decorative side borders so terminal selection stays useful.
 
 Recording belongs to the background service. Closing a UI must not stop capture. Transcription runs independently of capture; completed chunks append in recording order. Never discard transcript or audio without an explicit clear action. Cancel must stop active and queued transcription without deleting recordings or stopping live capture.
 
