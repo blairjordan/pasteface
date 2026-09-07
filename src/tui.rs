@@ -436,7 +436,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         } else {
             4
         }),
-        Constraint::Length(if queue_items.is_empty() { 0 } else { 2 }),
+        Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(shortcuts.len() as u16),
     ])
