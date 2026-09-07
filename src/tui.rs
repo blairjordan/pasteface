@@ -67,20 +67,15 @@ struct View {
     microphone: Option<usize>,
     levels: VecDeque<u64>,
     welcome_started: Option<Instant>,
-    completed: HashMap<String, Instant>,
+    completed: HashMap<String, Option<Instant>>,
 }
 
 fn queue_items(
     state: &State,
-    completed: &mut HashMap<String, Instant>,
+    completed: &mut HashMap<String, Option<Instant>>,
     now: Instant,
 ) -> Vec<(usize, f32)> {
-    completed.retain(|id, _| {
-        state
-            .chunks
-            .iter()
-            .any(|c| c.id == *id && c.status == ChunkStatus::Ready)
-    });
+    completed.retain(|id, _| state.chunks.iter().any(|c| c.id == *id));
     state
         .chunks
         .iter()
@@ -88,10 +83,16 @@ fn queue_items(
         .filter_map(|(index, chunk)| {
             let opacity = if chunk.status == ChunkStatus::Ready {
                 let elapsed = now
-                    .duration_since(*completed.entry(chunk.id.clone()).or_insert(now))
+                    .duration_since(
+                        *completed
+                            .entry(chunk.id.clone())
+                            .or_insert(Some(now - Duration::from_secs(4)))
+                            .get_or_insert(now),
+                    )
                     .as_secs_f32();
                 (1. - (elapsed - 3.5) / 0.5).clamp(0., 1.)
             } else {
+                completed.insert(chunk.id.clone(), None);
                 1.
             };
             (opacity > 0.).then_some((index, opacity))
@@ -1037,6 +1038,12 @@ mod tests {
         });
         let mut completed = HashMap::new();
         let now = Instant::now();
+        // Historical completions stay hidden, even after an initial empty snapshot.
+        assert!(queue_items(&State::default(), &mut completed, now).is_empty());
+        assert!(queue_items(&state, &mut completed, now).is_empty());
+        state.chunks[0].status = ChunkStatus::Transcribing;
+        assert_eq!(queue_items(&state, &mut completed, now), vec![(0, 1.)]);
+        state.chunks[0].status = ChunkStatus::Ready;
         assert_eq!(queue_items(&state, &mut completed, now), vec![(0, 1.)]);
         assert_eq!(
             queue_items(&state, &mut completed, now + Duration::from_millis(3500)),
