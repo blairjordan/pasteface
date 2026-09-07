@@ -1,0 +1,31 @@
+name: Rust
+on: [push, pull_request]
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Conventional Commits
+        run: |
+          git log --format=%s | while IFS= read -r subject; do
+            printf '%s\n' "$subject" | .githooks/commit-msg /dev/stdin
+          done
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libwayland-dev libxkbcommon-dev ffmpeg
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo check --no-default-features

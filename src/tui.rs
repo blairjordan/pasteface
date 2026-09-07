@@ -1,0 +1,1004 @@
+use crate::{
+    config::Config,
+    ipc::Client,
+    logo,
+    model::{Action, ChunkStatus, Phase, State, timestamp},
+    settings_ui::SettingsView,
+    tab_menu::{self, TabMenu},
+};
+use anyhow::Result;
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Bar, BarChart, BarGroup, Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+const BG: Color = Color::Rgb(18, 23, 30);
+const MUTED: Color = Color::Rgb(134, 150, 165);
+const MINT: Color = Color::Rgb(185, 239, 214);
+
+pub fn run(config: Config) -> Result<()> {
+    // The interface owns its dark palette, including under inherited NO_COLOR.
+    crossterm::style::force_color_output(true);
+    let client = Client::new(config);
+    let mut terminal = ratatui::init();
+    crossterm::execute!(
+        std::io::stdout(),
+        event::EnableBracketedPaste,
+        event::EnableMouseCapture
+    )?;
+    let result = interact(&mut terminal, &client);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        event::DisableBracketedPaste,
+        event::DisableMouseCapture
+    );
+    ratatui::restore();
+    result
+}
+#[derive(Clone)]
+enum Hit {
+    Key(KeyEvent),
+    Tab(usize),
+    Microphone(usize),
+    Command(Action),
+}
+#[derive(Default)]
+struct View {
+    settings: Option<SettingsView>,
+    tab_menu: Option<TabMenu>,
+    hits: Vec<(Rect, Hit)>,
+    tab: usize,
+    transcript_area: Rect,
+    copies: u64,
+    copied_until: Option<Instant>,
+    scroll: u16,
+    confirm: bool,
+    microphone: Option<usize>,
+    levels: VecDeque<u64>,
+}
+
+fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<()> {
+    let mut view = View::default();
+    loop {
+        let (state, error) = client.snapshot();
+        let copies = client.copies();
+        if copies != view.copies {
+            view.copies = copies;
+            view.copied_until = Some(Instant::now() + Duration::from_secs(2));
+        }
+        let level = if state.phase == Phase::Recording {
+            (state.level.sqrt().clamp(0., 1.) * 100.) as u64
+        } else {
+            0
+        };
+        view.levels.push_back(level);
+        if view.levels.len() > 80 {
+            view.levels.pop_front();
+        }
+        view.tab = view.tab.min(state.chunks.len());
+        terminal.draw(|f| draw(f, &state, error.as_deref(), &mut view))?;
+        if event::poll(Duration::from_millis(80))? {
+            let event = event::read()?;
+            if let Some(menu) = &mut view.tab_menu {
+                let (close, action) = menu.event(event, terminal.get_frame().area());
+                if let Some(action) = action {
+                    client.send(action);
+                }
+                if close {
+                    view.tab_menu = None;
+                }
+                continue;
+            }
+            if let Event::Paste(text) = &event {
+                if let Some(settings) = &mut view.settings {
+                    settings.paste(text);
+                }
+                continue;
+            }
+            let key = match event {
+                Event::Key(key) => key,
+                Event::Mouse(mouse) => {
+                    if view.microphone.is_none()
+                        && let Some(settings) = &mut view.settings
+                    {
+                        let (close, action) = settings.mouse(mouse, terminal.get_frame().area());
+                        if let Some(action) = action {
+                            if matches!(action, Action::Devices) {
+                                view.microphone = Some(microphone_index(&state));
+                            }
+                            client.send(action);
+                        }
+                        if close {
+                            view.settings = None;
+                        }
+                        continue;
+                    }
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Right) if view.microphone.is_none() => {
+                            if let Some((_, Hit::Tab(tab))) =
+                                view.hits.iter().rev().find(|(rect, _)| {
+                                    rect.contains((mouse.column, mouse.row).into())
+                                })
+                            {
+                                view.tab_menu = Some(TabMenu::new(
+                                    &state,
+                                    *tab,
+                                    (mouse.column, mouse.row),
+                                    false,
+                                ));
+                            }
+                            continue;
+                        }
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            let up = mouse.kind == MouseEventKind::ScrollUp;
+                            if view.microphone.is_some() {
+                                KeyEvent::from(if up { KeyCode::Up } else { KeyCode::Down })
+                            } else if view
+                                .transcript_area
+                                .contains((mouse.column, mouse.row).into())
+                            {
+                                view.scroll = if up {
+                                    view.scroll.saturating_sub(3)
+                                } else {
+                                    view.scroll.saturating_add(3)
+                                };
+                                continue;
+                            } else {
+                                continue;
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let hit = view
+                                .hits
+                                .iter()
+                                .rev()
+                                .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
+                                .map(|(_, hit)| hit.clone());
+                            match hit {
+                                Some(Hit::Key(key)) => key,
+                                Some(Hit::Tab(tab)) => {
+                                    view.tab = tab;
+                                    view.scroll = 0;
+                                    continue;
+                                }
+                                Some(Hit::Microphone(index)) => {
+                                    client.send(Action::SelectDevice(
+                                        index
+                                            .checked_sub(1)
+                                            .and_then(|i| state.devices.get(i).cloned()),
+                                    ));
+                                    view.microphone = None;
+                                    continue;
+                                }
+                                Some(Hit::Command(action)) => {
+                                    client.send(action);
+                                    continue;
+                                }
+                                None => {
+                                    view.microphone = None;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if view.microphone.is_none()
+                && let Some(settings) = &mut view.settings
+            {
+                let (close, action) = settings.key(key);
+                if let Some(action) = action {
+                    if matches!(action, Action::Devices) {
+                        view.microphone = Some(microphone_index(&state));
+                    }
+                    client.send(action);
+                }
+                if close {
+                    view.settings = None;
+                }
+                continue;
+            }
+            if key.code == KeyCode::Char('q') {
+                break;
+            }
+            if let Some(index) = view.microphone {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('m') => view.microphone = None,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        view.microphone = Some(index.saturating_sub(1))
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        view.microphone = Some((index + 1).min(state.devices.len()))
+                    }
+                    KeyCode::Enter => {
+                        client.send(Action::SelectDevice(
+                            index
+                                .checked_sub(1)
+                                .and_then(|i| state.devices.get(i).cloned()),
+                        ));
+                        view.microphone = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let action = match key.code {
+                KeyCode::F(2) => {
+                    view.tab_menu = Some(TabMenu::new(&state, view.tab, (0, 0), true));
+                    None
+                }
+                KeyCode::Char(']') | KeyCode::Tab => {
+                    view.tab = (view.tab + 1) % (state.chunks.len() + 1);
+                    view.scroll = 0;
+                    None
+                }
+                KeyCode::Char('[') | KeyCode::BackTab => {
+                    view.tab = if view.tab == 0 {
+                        state.chunks.len()
+                    } else {
+                        view.tab - 1
+                    };
+                    view.scroll = 0;
+                    None
+                }
+                KeyCode::Char('s') => {
+                    view.settings = Some(SettingsView::new(state.backend.clone()));
+                    None
+                }
+                KeyCode::Char(' ') => Some(Action::Toggle),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(Action::CopyLatest)
+                }
+                KeyCode::Char('c') => Some(Action::Copy),
+                KeyCode::Esc if view.confirm => {
+                    view.confirm = false;
+                    None
+                }
+                KeyCode::Esc => Some(Action::Cancel),
+                KeyCode::Char('x') if view.confirm => {
+                    view.scroll = 0;
+                    Some(Action::Clear)
+                }
+                KeyCode::Char('x') => {
+                    view.confirm = true;
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    view.scroll = view
+                        .scroll
+                        .saturating_add(1)
+                        .min(state.transcript.len().min(u16::MAX as usize) as u16);
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    view.scroll = view.scroll.saturating_sub(1);
+                    None
+                }
+                KeyCode::Home => {
+                    view.scroll = 0;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                client.send(action);
+                view.confirm = false;
+            } else if key.code != KeyCode::Char('x') {
+                view.confirm = false;
+            }
+        }
+    }
+    Ok(())
+}
+fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &mut View) {
+    view.hits.clear();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BG).fg(Color::Rgb(234, 239, 242))),
+        frame.area(),
+    );
+    if frame.area().width < 44 || frame.area().height < 14 {
+        frame.render_widget(
+            Paragraph::new(
+                "pasteface\nResize to 44 × 14 or larger.\nSpace record/stop · c copy · q close",
+            )
+            .wrap(Wrap { trim: false }),
+            frame.area(),
+        );
+        return;
+    }
+    let shortcuts = shortcuts(frame.area().width.saturating_sub(2));
+    let rows = Layout::vertical([
+        Constraint::Length(u16::from(!state.chunks.is_empty())),
+        Constraint::Min(4),
+        Constraint::Length(if state.phase == Phase::Recording {
+            6
+        } else {
+            4
+        }),
+        Constraint::Length(if state.chunks.is_empty() { 0 } else { 2 }),
+        Constraint::Length(1),
+        Constraint::Length(shortcuts.len() as u16),
+    ])
+    .horizontal_margin(1)
+    .vertical_margin(0)
+    .split(frame.area());
+    view.transcript_area = rows[1];
+    if !state.chunks.is_empty() {
+        transcript_tabs(frame, state, view, rows[0]);
+    }
+    let selected = view.tab.checked_sub(1).and_then(|i| state.chunks.get(i));
+    let transcript = selected.map_or(state.transcript.as_str(), |chunk| chunk.text.as_str());
+    if transcript.is_empty() && !state.phase.busy() && selected.is_none() {
+        welcome(frame, rows[1]);
+    } else {
+        let text = if transcript.is_empty() {
+            selected.map_or(
+                "Your words will appear here after you stop recording.",
+                |chunk| match chunk.status {
+                    ChunkStatus::Recording => "Recording this chunk…",
+                    ChunkStatus::Queued => "Waiting for transcription…",
+                    ChunkStatus::Transcribing => "Transcribing this chunk…",
+                    ChunkStatus::Canceled => "Transcription canceled. Audio retained.",
+                    ChunkStatus::Failed => chunk
+                        .error
+                        .as_deref()
+                        .unwrap_or("Transcription failed. Audio retained."),
+                    ChunkStatus::Ready => "No speech detected in this chunk.",
+                },
+            )
+        } else {
+            transcript
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(if transcript.is_empty() {
+                    Style::default().fg(MUTED)
+                } else {
+                    Style::default()
+                })
+                .wrap(Wrap { trim: false })
+                .scroll((view.scroll, 0))
+                .block(
+                    Block::default().title(
+                        Line::from(format!(
+                            "TRANSCRIPT · {} words",
+                            transcript.split_whitespace().count()
+                        ))
+                        .fg(MUTED),
+                    ),
+                ),
+            rows[1],
+        );
+    }
+    if let Some(chunk) = selected.filter(|chunk| !chunk.text.is_empty()) {
+        let label = "[Copy chunk]";
+        let area = Rect::new(
+            rows[1].right().saturating_sub(label.len() as u16),
+            rows[1].y,
+            label.len() as u16,
+            1,
+        );
+        frame.render_widget(Paragraph::new(label).fg(MINT), area);
+        view.hits
+            .push((area, Hit::Command(Action::CopyChunk(chunk.id.clone()))));
+    }
+    let color = match state.phase {
+        Phase::Recording | Phase::Error => Color::Rgb(255, 124, 139),
+        Phase::Transcribing => Color::Rgb(243, 199, 125),
+        _ => MINT,
+    };
+    let label = format!(
+        " {} {}",
+        if state.phase == Phase::Recording {
+            "●"
+        } else {
+            "○"
+        },
+        state.phase.label()
+    );
+    let mut status = label
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let gain = if i == 1 && state.phase == Phase::Recording {
+                crate::animation::pulse()
+            } else if state.phase.busy() {
+                crate::animation::shimmer(i, label.len())
+            } else {
+                1.
+            };
+            let tint = match color {
+                Color::Rgb(r, g, b) => Color::Rgb(
+                    (r as f32 * gain) as u8,
+                    (g as f32 * gain) as u8,
+                    (b as f32 * gain) as u8,
+                ),
+                _ => color,
+            };
+            Span::styled(c.to_string(), Style::default().fg(tint).bold())
+        })
+        .collect::<Vec<_>>();
+    let duration = match state.phase {
+        Phase::Recording => Some(format!("  {}", timestamp(state.seconds))),
+        Phase::Transcribing => state
+            .chunks
+            .iter()
+            .find(|chunk| chunk.status == ChunkStatus::Transcribing)
+            .map(|chunk| format!("  {} audio", timestamp(chunk.seconds))),
+        _ => None,
+    };
+    if let Some(duration) = duration {
+        status.push(Span::styled(duration, Style::default().fg(color)));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(status))
+            .block(Block::bordered().border_style(Style::default().fg(Color::Rgb(48, 61, 72)))),
+        rows[2],
+    );
+    view.hits.push((
+        Rect::new(
+            rows[2].x + 1,
+            rows[2].y + 1,
+            rows[2].width.saturating_sub(2),
+            1,
+        ),
+        Hit::Key(KeyEvent::from(KeyCode::Char(' '))),
+    ));
+    if rows[2].height >= 5 {
+        let inner = Rect::new(
+            rows[2].x + 2,
+            rows[2].y + 2,
+            rows[2].width.saturating_sub(4),
+            rows[2].height - 4,
+        );
+        let count = (inner.width / 4) as usize;
+        let values = view
+            .levels
+            .iter()
+            .rev()
+            .take(count)
+            .copied()
+            .collect::<Vec<_>>();
+        let bars = values
+            .iter()
+            .rev()
+            .map(|v| Bar::default().value(*v).text_value(String::new()))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            BarChart::default()
+                .data(BarGroup::default().bars(&bars))
+                .max(100)
+                .bar_width(3)
+                .bar_gap(1)
+                .bar_style(Style::default().fg(MINT)),
+            inner,
+        );
+    }
+    let mic_area = Rect::new(
+        rows[2].x + 2,
+        rows[2].bottom().saturating_sub(2),
+        rows[2].width.saturating_sub(4),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(format!("MIC  {}  ·  [S] settings", state.device)).fg(MUTED),
+        mic_area,
+    );
+    view.hits
+        .push((mic_area, Hit::Key(KeyEvent::from(KeyCode::Char('s')))));
+    let copied = view
+        .copied_until
+        .is_some_and(|until| Instant::now() < until);
+    if copied && error.is_none() && rows[1].height > 0 {
+        let label = " ✓ Copied to clipboard ";
+        let width = (label.chars().count() as u16).min(rows[1].width);
+        let toast = Rect::new(
+            rows[1].right().saturating_sub(width),
+            rows[1].bottom().saturating_sub(1),
+            width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().bg(MINT).fg(BG).bold()),
+            toast,
+        );
+    }
+    let notice = if view.confirm {
+        "Clear transcript and saved audio? [X] confirm · [Esc] dismiss"
+    } else {
+        error.unwrap_or(
+            if copied || state.phase.busy() || state.message == "Copied to clipboard." {
+                ""
+            } else {
+                &state.message
+            },
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(notice)
+            .fg(if error.is_some() {
+                Color::LightRed
+            } else if copied {
+                MINT
+            } else {
+                MUTED
+            })
+            .wrap(Wrap { trim: false }),
+        rows[4],
+    );
+    for (row, line) in shortcuts.iter().enumerate() {
+        let text = line.to_string();
+        for (label, key) in shortcut_controls() {
+            if let Some(start) = text.find(label) {
+                view.hits.push((
+                    Rect::new(
+                        rows[5].x + text[..start].chars().count() as u16,
+                        rows[5].y + row as u16,
+                        label.chars().count() as u16,
+                        1,
+                    ),
+                    Hit::Key(key),
+                ));
+            }
+        }
+    }
+    if view.confirm {
+        let label = notice;
+        for (text, key) in [
+            ("[X] confirm", KeyCode::Char('x')),
+            ("[Esc] dismiss", KeyCode::Esc),
+        ] {
+            if let Some(start) = label.find(text) {
+                view.hits.push((
+                    Rect::new(
+                        rows[4].x + label[..start].chars().count() as u16,
+                        rows[4].y,
+                        text.len() as u16,
+                        1,
+                    ),
+                    Hit::Key(KeyEvent::from(key)),
+                ));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(shortcuts).fg(MINT), rows[5]);
+    queue(frame, state, rows[3], &mut view.hits);
+    if let Some(settings) = &view.settings {
+        settings.draw(frame, &state.device);
+    }
+    if let Some(index) = view.microphone {
+        view.hits.clear();
+        microphone_picker(frame, state, index, &mut view.hits);
+    }
+    if let Some(menu) = &view.tab_menu {
+        menu.draw(frame);
+    }
+}
+fn transcript_tabs(frame: &mut ratatui::Frame, state: &State, view: &mut View, area: Rect) {
+    let labels = (0..=state.chunks.len())
+        .map(|tab| {
+            let name = tab_menu::title(state, tab);
+            let short = if name.chars().count() > 18 {
+                format!("{}…", name.chars().take(17).collect::<String>())
+            } else {
+                name
+            };
+            if tab == 0 {
+                short
+            } else {
+                format!("{short} · {}", timestamp(state.chunks[tab - 1].seconds))
+            }
+        })
+        .collect::<Vec<_>>();
+    // Keep the selected tab visible; arrows and Tab reach every chunk.
+    let available = area.width.saturating_sub(6);
+    let mut start = 0;
+    while start < view.tab
+        && labels[start..=view.tab]
+            .iter()
+            .map(|s| s.chars().count() + 2)
+            .sum::<usize>()
+            > available as usize
+    {
+        start += 1;
+    }
+    let mut x = area.x;
+    if start > 0 {
+        frame.render_widget(Paragraph::new("‹ ").fg(MINT), Rect::new(x, area.y, 2, 1));
+        view.hits.push((
+            Rect::new(x, area.y, 2, 1),
+            Hit::Key(KeyEvent::from(KeyCode::Char('['))),
+        ));
+        x += 2;
+    }
+    for (index, label) in labels.iter().enumerate().skip(start) {
+        let width = label.chars().count() as u16 + 2;
+        if x + width > area.right().saturating_sub(2) {
+            let end = Rect::new(area.right().saturating_sub(2), area.y, 2, 1);
+            frame.render_widget(Paragraph::new(" ›").fg(MINT), end);
+            view.hits
+                .push((end, Hit::Key(KeyEvent::from(KeyCode::Char(']')))));
+            break;
+        }
+        let tab = Rect::new(x, area.y, width, 1);
+        let style = if index == view.tab {
+            Style::default().fg(MINT).bg(Color::Rgb(38, 66, 61)).bold()
+        } else {
+            Style::default().fg(MUTED)
+        };
+        frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), tab);
+        view.hits.push((tab, Hit::Tab(index)));
+        x += width;
+    }
+}
+
+fn shortcut_controls() -> Vec<(&'static str, KeyEvent)> {
+    [
+        ("[Space] record/stop", KeyCode::Char(' ')),
+        ("[C] copy", KeyCode::Char('c')),
+        ("[Ctrl+C] latest", KeyCode::Char('c')),
+        ("[X] clear", KeyCode::Char('x')),
+        ("[S] settings", KeyCode::Char('s')),
+        ("[↑↓] scroll", KeyCode::Down),
+        ("[Tab] next", KeyCode::Tab),
+        ("[Esc] cancel", KeyCode::Esc),
+        ("[Q] close", KeyCode::Char('q')),
+    ]
+    .into_iter()
+    .map(|(label, code)| {
+        (
+            label,
+            KeyEvent::new(
+                code,
+                if label == "[Ctrl+C] latest" {
+                    KeyModifiers::CONTROL
+                } else {
+                    KeyModifiers::NONE
+                },
+            ),
+        )
+    })
+    .collect()
+}
+fn shortcuts(width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut row = String::new();
+    for (shortcut, _) in shortcut_controls() {
+        if !row.is_empty() && row.chars().count() + 2 + shortcut.chars().count() > width as usize {
+            lines.push(Line::from(std::mem::take(&mut row)));
+        }
+        if !row.is_empty() {
+            row.push_str("  ");
+        }
+        row.push_str(shortcut);
+    }
+    if !row.is_empty() {
+        lines.push(Line::from(row));
+    }
+    lines
+}
+
+fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
+    if area.height < 2 || state.chunks.is_empty() {
+        return;
+    }
+    let done = state
+        .chunks
+        .iter()
+        .filter(|c| c.status == ChunkStatus::Ready)
+        .count();
+    frame.render_widget(
+        Paragraph::new(format!(
+            "QUEUE  {} waiting · {} transcribing · {} done",
+            state.queue_depth,
+            usize::from(state.transcribing),
+            done
+        ))
+        .fg(MUTED),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    // Always show current work before old completed chunks; summarize overflow.
+    let mut indices = (0..state.chunks.len()).collect::<Vec<_>>();
+    indices.sort_by_key(|i| match state.chunks[*i].status {
+        ChunkStatus::Recording => (0, *i),
+        ChunkStatus::Transcribing => (1, *i),
+        ChunkStatus::Queued => (2, *i),
+        ChunkStatus::Failed => (3, *i),
+        ChunkStatus::Ready => (4, usize::MAX - *i),
+        ChunkStatus::Canceled => (5, usize::MAX - *i),
+    });
+    let chip = |index: usize| {
+        let chunk = &state.chunks[index];
+        let (label, color) = match chunk.status {
+            ChunkStatus::Recording => ("● REC", Color::Rgb(255, 124, 139)),
+            ChunkStatus::Transcribing => ("◌ TEXT", Color::Rgb(243, 199, 125)),
+            ChunkStatus::Queued => ("WAIT", Color::Rgb(132, 179, 230)),
+            ChunkStatus::Ready => ("DONE", MINT),
+            ChunkStatus::Failed => ("ERROR", Color::Rgb(255, 124, 139)),
+            ChunkStatus::Canceled => ("CANCEL", MUTED),
+        };
+        Span::styled(
+            format!("{:02} {label} {}", index + 1, timestamp(chunk.seconds)),
+            Style::default().fg(color).bg(Color::Rgb(32, 41, 51)),
+        )
+    };
+    let mut remaining = area.width as usize;
+    indices.retain(|index| {
+        let width = chip(*index).width();
+        if width > remaining {
+            return false;
+        }
+        remaining = remaining.saturating_sub(width + 1);
+        true
+    });
+    let overflow = state.chunks.len() - indices.len();
+    indices.sort_unstable();
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for index in indices {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+            x += 1;
+        }
+        let span = chip(index);
+        hits.push((
+            Rect::new(x, area.y + 1, span.width() as u16, 1),
+            Hit::Tab(index + 1),
+        ));
+        x += span.width() as u16;
+        spans.push(span);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+    if overflow > 0 {
+        let message = format!(" +{overflow} more");
+        let width = message.len() as u16;
+        if area.width > width {
+            frame.render_widget(
+                Paragraph::new(message).fg(MUTED),
+                Rect::new(area.right() - width, area.y, width, 1),
+            );
+        }
+    }
+}
+
+fn welcome(frame: &mut ratatui::Frame, area: Rect) {
+    let mut lines = if area.height as usize >= logo::ANSI_FACE.len() + 3 {
+        logo::ANSI_FACE
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let step = (i * 10 / (logo::ANSI_FACE.len() - 1).max(1)) as u8;
+                let tint = Color::Rgb(190 - step * 8, 245 - step * 7, 209 + step * 3);
+                Line::from(*line).fg(tint).centered()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![Line::from("◉  pasteface").fg(MINT).bold().centered()]
+    };
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from(vec![
+            Span::raw("A little space to "),
+            Span::styled("think out loud.", Style::default().fg(MINT).bold()),
+        ])
+        .centered(),
+    );
+    lines.push(
+        Line::from("Press Space. Let the words come.")
+            .fg(MUTED)
+            .centered(),
+    );
+    let height = lines.len() as u16;
+    let top = area.y + area.height.saturating_sub(height) / 2;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(area.x, top, area.width, height.min(area.height)),
+    );
+}
+fn microphone_index(state: &State) -> usize {
+    state
+        .selected_device
+        .as_ref()
+        .and_then(|device| state.devices.iter().position(|d| d == device))
+        .map_or(0, |index| index + 1)
+}
+fn microphone_picker(
+    frame: &mut ratatui::Frame,
+    state: &State,
+    index: usize,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let width = frame.area().width.saturating_sub(6).min(70);
+    let height = (state.devices.len() as u16 + 5).min(frame.area().height.saturating_sub(4));
+    let area = Rect::new(
+        (frame.area().width - width) / 2,
+        (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let items = std::iter::once("System default microphone")
+        .chain(state.devices.iter().map(String::as_str))
+        .map(ListItem::new)
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(" MICROPHONE ")
+                .title_bottom(" ↑↓ choose · Enter select · Esc cancel "),
+        )
+        .style(Style::default().bg(BG).fg(MUTED))
+        .highlight_style(Style::default().bg(Color::Rgb(38, 66, 61)).fg(MINT).bold())
+        .highlight_symbol("› ");
+    let mut selection = ListState::default().with_selected(Some(index.min(state.devices.len())));
+    frame.render_stateful_widget(list, area, &mut selection);
+    for row in 0..area.height.saturating_sub(2) {
+        let item = selection.offset() + row as usize;
+        if item <= state.devices.len() {
+            hits.push((
+                Rect::new(
+                    area.x + 1,
+                    area.y + 1 + row,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                Hit::Microphone(item),
+            ));
+        }
+    }
+    hits.push((
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        Hit::Key(KeyEvent::from(KeyCode::Esc)),
+    ));
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn queue_chips_fit_two_rows_with_duration_and_cancellation() {
+        let mut state = State::default();
+        for status in [
+            ChunkStatus::Queued,
+            ChunkStatus::Transcribing,
+            ChunkStatus::Canceled,
+        ] {
+            state.chunks.push(crate::model::Chunk {
+                title: String::new(),
+                id: String::new(),
+                status,
+                text: String::new(),
+                error: None,
+                seconds: 65.,
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        terminal
+            .draw(|f| queue(f, &state, f.area(), &mut Vec::new()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("01 WAIT 01:05"));
+        assert!(text.contains("02 ◌ TEXT 01:05"));
+        assert!(text.contains("03 CANCEL 01:05"));
+    }
+    #[test]
+    fn recording_has_one_status_line_and_no_duplicate_meter() {
+        let state = State {
+            phase: Phase::Recording,
+            seconds: 12.,
+            level: 0.5,
+            ..State::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| draw(f, &state, None, &mut View::default()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(text.matches("Listening").count(), 1);
+        assert_eq!(text.matches("00:12").count(), 1);
+        assert!(!text.contains("queued"));
+        assert!(!text.contains("░"));
+        assert!(text.contains("MIC"));
+    }
+    #[test]
+    fn tabs_render_selected_text_and_expose_click_targets() {
+        let state = State {
+            transcript: "First thought.\nSecond thought.".into(),
+            phase: Phase::Ready,
+            chunks: ["First thought.", "Second thought."]
+                .iter()
+                .enumerate()
+                .map(|(i, text)| crate::model::Chunk {
+                    title: String::new(),
+                    id: format!("chunk-{i}"),
+                    text: (*text).into(),
+                    status: ChunkStatus::Ready,
+                    error: None,
+                    seconds: 12.,
+                })
+                .collect(),
+            ..State::default()
+        };
+        let mut view = View {
+            tab: 2,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &state, None, &mut view)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Second thought."));
+        assert!(!text.contains("First thought."));
+        assert!(view.hits.iter().any(|(_, hit)| matches!(hit, Hit::Tab(1))));
+        assert!(
+            view.hits.iter().any(
+                |(_, hit)| matches!(hit, Hit::Command(Action::CopyChunk(id)) if id == "chunk-1")
+            )
+        );
+        for y in view.transcript_area.y..view.transcript_area.bottom() {
+            assert_ne!(
+                terminal.backend().buffer()[(view.transcript_area.x, y)].symbol(),
+                "│"
+            );
+        }
+    }
+    #[test]
+    fn welcome_and_transcript_fit() {
+        for (width, height) in [(100, 36), (44, 14), (20, 8)] {
+            let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+            t.draw(|f| draw(f, &State::default(), None, &mut View::default()))
+                .unwrap();
+            let state = State {
+                transcript: "A thought worth keeping.".into(),
+                phase: Phase::Ready,
+                ..State::default()
+            };
+            t.draw(|f| draw(f, &state, None, &mut View::default()))
+                .unwrap();
+            if width >= 44 {
+                let text: String = t
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(text.contains("A thought worth keeping."));
+            }
+        }
+    }
+}
