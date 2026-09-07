@@ -437,7 +437,6 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         } else {
             4
         }),
-        Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(shortcuts.len() as u16),
     ])
@@ -644,6 +643,12 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             toast,
         );
     }
+    let notice_area = Rect::new(
+        rows[1].x,
+        rows[1].bottom().saturating_sub(1),
+        rows[1].width,
+        1,
+    );
     let notice = if view.confirm {
         "Clear this tab and its audio? [X] confirm · [Esc] dismiss"
     } else {
@@ -668,7 +673,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
                 MUTED
             })
             .wrap(Wrap { trim: false }),
-        rows[4],
+        notice_area,
     );
     for (row, line) in shortcuts.iter().enumerate() {
         let text = line.to_string();
@@ -676,8 +681,8 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             if let Some(start) = text.find(label) {
                 view.hits.push((
                     Rect::new(
-                        rows[5].x + text[..start].chars().count() as u16,
-                        rows[5].y + row as u16,
+                        rows[4].x + text[..start].chars().count() as u16,
+                        rows[4].y + row as u16,
                         label.chars().count() as u16,
                         1,
                     ),
@@ -695,8 +700,8 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             if let Some(start) = label.find(text) {
                 view.hits.push((
                     Rect::new(
-                        rows[4].x + label[..start].chars().count() as u16,
-                        rows[4].y,
+                        notice_area.x + label[..start].chars().count() as u16,
+                        notice_area.y,
                         text.len() as u16,
                         1,
                     ),
@@ -705,7 +710,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             }
         }
     }
-    frame.render_widget(Paragraph::new(shortcuts).fg(MINT), rows[5]);
+    frame.render_widget(Paragraph::new(shortcuts).fg(MINT), rows[4]);
     queue(frame, state, rows[3], &mut view.hits, &queue_items);
     if let Some(settings) = &view.settings {
         settings.draw(frame, &state.device);
@@ -843,23 +848,9 @@ fn queue(
     hits: &mut Vec<(Rect, Hit)>,
     items: &[(usize, f32)],
 ) {
-    if area.height < 2 || items.is_empty() {
+    if area.height == 0 || items.is_empty() {
         return;
     }
-    let done = items
-        .iter()
-        .filter(|(index, _)| state.chunks[*index].status == ChunkStatus::Ready)
-        .count();
-    frame.render_widget(
-        Paragraph::new(format!(
-            "QUEUE  {} waiting · {} transcribing · {} done",
-            state.queue_depth,
-            usize::from(state.transcribing),
-            done
-        ))
-        .fg(MUTED),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
     // Always show current work before old completed chunks; summarize overflow.
     let mut indices = items.iter().map(|(index, _)| *index).collect::<Vec<_>>();
     indices.sort_by_key(|i| match state.chunks[*i].status {
@@ -893,7 +884,13 @@ fn queue(
             },
         )
     };
-    let mut remaining = area.width as usize;
+    let total_width: usize = indices.iter().map(|i| chip(*i).width() + 1).sum();
+    let overflow_width = if total_width.saturating_sub(1) > area.width as usize {
+        format!(" +{} more", items.len()).len()
+    } else {
+        0
+    };
+    let mut remaining = (area.width as usize).saturating_sub(overflow_width);
     indices.retain(|index| {
         let width = chip(*index).width();
         if width > remaining {
@@ -913,7 +910,7 @@ fn queue(
         }
         let span = chip(index);
         hits.push((
-            Rect::new(x, area.y + 1, span.width() as u16, 1),
+            Rect::new(x, area.y, span.width() as u16, 1),
             Hit::SelectTab(state.chunks[index].tab_id.clone()),
         ));
         x += span.width() as u16;
@@ -921,7 +918,7 @@ fn queue(
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
-        Rect::new(area.x, area.y + 1, area.width, 1),
+        Rect::new(area.x, area.y, area.width, 1),
     );
     if overflow > 0 {
         let message = format!(" +{overflow} more");
@@ -1068,7 +1065,7 @@ mod tests {
         assert_eq!(fade(MINT, 0.), BG);
     }
     #[test]
-    fn queue_chips_fit_two_rows_with_duration_and_cancellation() {
+    fn queue_chips_fit_one_row_with_duration_and_cancellation() {
         let mut state = State::default();
         for status in [
             ChunkStatus::Queued,
@@ -1085,7 +1082,7 @@ mod tests {
                 seconds: 65.,
             });
         }
-        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
             .draw(|f| {
                 queue(
