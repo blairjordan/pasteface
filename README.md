@@ -80,7 +80,7 @@ Run `pasteface` to open the terminal interface and start the tray companion.
 | **Esc** | Cancel active transcription and all queued chunks |
 | **Q** | Close the terminal interface |
 
-Click **+** to create a named transcript tab. New recordings append to the selected tab; recording a chunk never creates a tab. Click a tab to switch transcripts, or click a queue block to open its owning tab. Tabs also support **[ / ]** navigation. Right-click a tab and choose **Rename**, or press **F2**, to give it a persistent name.
+Click **+** to create a named transcript tab. New recordings append to the selected tab; recording a chunk never creates a tab. Click a tab to switch transcripts, or click a queue block to open its owning tab. Tabs also support **[ / ]** navigation. Right-click a tab and choose **Rename**, or press **F2**, to give it a persistent name. **Close tab** in the same menu hides the tab while retaining its transcript and audio. Use **Reopen** beside **+** to restore closed tabs.
 
 Click the footer controls to record, copy, clear, cancel, or open settings. Settings and the microphone picker support clicks and the mouse wheel. Scroll over the transcript with the wheel. Drag across transcript text to highlight and copy it; hold **Shift** while dragging to use native terminal selection instead.
 

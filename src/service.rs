@@ -45,7 +45,7 @@ impl Recorder {
         if state.chunks.is_empty() && state.prior_transcript.is_empty() {
             state.prior_transcript = state.transcript.clone();
         }
-        if state.tabs.is_empty() {
+        if state.tabs.is_empty() && state.closed_tabs.is_empty() {
             let mut tab = TranscriptTab::default();
             if !state.transcript_title.is_empty() {
                 tab.name = std::mem::take(&mut state.transcript_title);
@@ -53,14 +53,22 @@ impl Recorder {
             state.tabs.push(tab);
         }
         if !state.tabs.iter().any(|tab| tab.id == state.selected_tab) {
-            state.selected_tab = state.tabs[0].id.clone();
+            state.selected_tab = state
+                .tabs
+                .first()
+                .map_or_else(String::new, |tab| tab.id.clone());
         }
-        if state.tabs[0].prior_transcript.is_empty() {
-            state.tabs[0].prior_transcript = std::mem::take(&mut state.prior_transcript);
+        if let Some(tab) = state.tabs.first_mut()
+            && tab.prior_transcript.is_empty()
+        {
+            tab.prior_transcript = std::mem::take(&mut state.prior_transcript);
         }
         for chunk in &mut state.chunks {
             if chunk.tab_id.is_empty() {
-                chunk.tab_id = state.tabs[0].id.clone();
+                chunk.tab_id = state
+                    .tabs
+                    .first()
+                    .map_or_else(|| "default".into(), |tab| tab.id.clone());
             }
             if chunk.seconds == 0. {
                 chunk.seconds = crate::audio::duration(
@@ -359,6 +367,10 @@ impl Recorder {
             }
             Action::Start => {
                 ensure!(self.capture.is_none(), "Already recording.");
+                ensure!(
+                    !self.state.selected_tab.is_empty(),
+                    "Create or reopen a tab before recording."
+                );
                 self.config.check_model()?;
                 let index = self.add_chunk(ChunkStatus::Recording)?;
                 match Capture::start(
@@ -473,7 +485,41 @@ impl Recorder {
                 self.rebuild_transcript();
                 self.state.message = "Tab created.".into();
             }
+            Action::CloseTab(id) => {
+                let index = self
+                    .state
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == id)
+                    .context("Tab is no longer available.")?;
+                let tab = self.state.tabs.remove(index);
+                self.state.closed_tabs.push(tab);
+                if self.state.selected_tab == id {
+                    self.state.selected_tab = self
+                        .state
+                        .tabs
+                        .get(index.min(self.state.tabs.len().saturating_sub(1)))
+                        .map_or_else(String::new, |tab| tab.id.clone());
+                }
+                self.rebuild_transcript();
+                self.state.message = "Tab closed. Transcript and recordings saved.".into();
+            }
+            Action::ReopenTab => {
+                let tab = self
+                    .state
+                    .closed_tabs
+                    .pop()
+                    .context("No closed tabs to reopen.")?;
+                self.state.selected_tab = tab.id.clone();
+                self.state.tabs.push(tab);
+                self.rebuild_transcript();
+                self.state.message = "Tab reopened.".into();
+            }
             Action::SelectTab(id) => {
+                if let Some(index) = self.state.closed_tabs.iter().position(|tab| tab.id == id) {
+                    let tab = self.state.closed_tabs.remove(index);
+                    self.state.tabs.push(tab);
+                }
                 ensure!(
                     self.state.tabs.iter().any(|tab| tab.id == id),
                     "Tab is no longer available."
@@ -519,6 +565,10 @@ impl Recorder {
                 self.copy_text(text)?;
             }
             Action::Clear => {
+                ensure!(
+                    !self.state.selected_tab.is_empty(),
+                    "Select a tab before clearing."
+                );
                 ensure!(
                     self.capture.is_none() && self.pending.is_none() && self.state.queue_depth == 0,
                     "Finish recording and let the queue drain before clearing."
@@ -826,6 +876,24 @@ mod tests {
         assert_eq!(restored.state.tabs[1].name, "Meeting notes");
         assert_eq!(restored.state.transcript, "First words\nMore words");
         assert_eq!(restored.state.chunks[second].text, "Separate words");
+    }
+    #[test]
+    fn closing_last_tab_preserves_audio_and_reopens_after_restart() {
+        let (_temp, mut recorder) = setup();
+        let index = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[index].text = "Keep these words".into();
+        let path = recorder.directory(index).join("recording.wav");
+        fs::write(&path, b"saved audio").unwrap();
+        recorder.action(Action::CloseTab("default".into())).unwrap();
+        assert!(recorder.state.tabs.is_empty());
+        assert!(recorder.state.transcript.is_empty());
+        let mut restored = Recorder::new(recorder.config.clone()).unwrap();
+        assert!(restored.state.tabs.is_empty());
+        assert_eq!(restored.state.closed_tabs.len(), 1);
+        assert!(path.exists());
+        restored.action(Action::ReopenTab).unwrap();
+        assert_eq!(restored.state.transcript, "Keep these words");
+        assert_eq!(restored.state.selected_tab, "default");
     }
     #[test]
     fn lock_prevents_two_recorders() {

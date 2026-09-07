@@ -13,6 +13,7 @@ pub struct TabMenu {
     position: (u16, u16),
     renaming: bool,
     replace: bool,
+    menu_index: usize,
 }
 impl TabMenu {
     pub fn new(state: &State, tab: usize, position: (u16, u16), renaming: bool) -> Self {
@@ -22,6 +23,7 @@ impl TabMenu {
             position,
             renaming,
             replace: true,
+            menu_index: 0,
         }
     }
     pub fn create() -> Self {
@@ -31,6 +33,7 @@ impl TabMenu {
             position: (0, 0),
             renaming: true,
             replace: false,
+            menu_index: 0,
         }
     }
     fn area(&self, screen: Rect) -> Rect {
@@ -46,11 +49,18 @@ impl TabMenu {
             let width = 18.min(screen.width);
             Rect::new(
                 self.position.0.min(screen.right().saturating_sub(width)),
-                self.position.1.min(screen.bottom().saturating_sub(3)),
+                self.position.1.min(screen.bottom().saturating_sub(4)),
                 width,
-                3.min(screen.height),
+                4.min(screen.height),
             )
         }
+    }
+    fn choose(&mut self) -> (bool, Option<Action>) {
+        if self.menu_index == 1 {
+            return (true, self.id.clone().map(Action::CloseTab));
+        }
+        self.renaming = true;
+        (false, None)
     }
     fn save(&self) -> Option<Action> {
         let name = self.name.trim();
@@ -85,7 +95,9 @@ impl TabMenu {
                     let action = self.save();
                     return (action.is_some(), action);
                 }
-                KeyCode::Enter => self.renaming = true,
+                KeyCode::Enter => return self.choose(),
+                KeyCode::Up if !self.renaming => self.menu_index = 0,
+                KeyCode::Down if !self.renaming => self.menu_index = 1,
                 KeyCode::Backspace if self.renaming => {
                     if self.replace {
                         self.name.clear();
@@ -117,8 +129,9 @@ impl TabMenu {
                     return (true, None);
                 }
                 if !self.renaming {
-                    if mouse.row == area.y + 1 {
-                        self.renaming = true;
+                    if mouse.row > area.y && mouse.row < area.bottom() - 1 {
+                        self.menu_index = (mouse.row - area.y - 1) as usize;
+                        return self.choose();
                     }
                 } else if mouse.row == area.y + 5 {
                     if mouse.column < area.x + 12 {
@@ -180,7 +193,19 @@ impl TabMenu {
                 area.y + 3,
             ));
         } else {
-            frame.render_widget(Paragraph::new("Rename…").block(block), area);
+            let lines = ["Rename…", "Close tab"]
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let line = Line::from(*label);
+                    if i == self.menu_index {
+                        line.bg(Color::Rgb(38, 66, 61)).bold()
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines).block(block), area);
         }
     }
 }

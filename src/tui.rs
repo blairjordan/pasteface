@@ -48,6 +48,7 @@ pub fn run(config: Config) -> Result<()> {
 enum Hit {
     Key(KeyEvent),
     Tab(usize),
+    SelectTab(String),
     Microphone(usize),
 }
 #[derive(Default)]
@@ -217,6 +218,11 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                                     view.scroll = 0;
                                     continue;
                                 }
+                                Some(Hit::SelectTab(id)) => {
+                                    client.send(Action::SelectTab(id));
+                                    view.scroll = 0;
+                                    continue;
+                                }
                                 Some(Hit::Microphone(index)) => {
                                     client.send(Action::SelectDevice(
                                         index
@@ -282,11 +288,12 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                 continue;
             }
             let action = match key.code {
+                KeyCode::Char('t') => Some(Action::ReopenTab),
                 KeyCode::Char('+') => {
                     view.tab_menu = Some(TabMenu::create());
                     None
                 }
-                KeyCode::F(2) => {
+                KeyCode::F(2) if !state.tabs.is_empty() => {
                     view.tab_menu = Some(TabMenu::new(&state, view.tab, (0, 0), true));
                     None
                 }
@@ -405,6 +412,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             rows[1],
             view.welcome_started
                 .map_or(2., |start| start.elapsed().as_secs_f32()),
+            !state.tabs.is_empty(),
         );
     } else {
         let text = if transcript.is_empty() {
@@ -677,7 +685,20 @@ fn transcript_tabs(frame: &mut ratatui::Frame, state: &State, view: &mut View, a
     frame.render_widget(Paragraph::new(" + ").fg(MINT).bold(), plus);
     view.hits
         .push((plus, Hit::Key(KeyEvent::from(KeyCode::Char('+')))));
-    let area = Rect::new(area.x, area.y, area.width.saturating_sub(4), area.height);
+    let mut remaining = area.width.saturating_sub(4);
+    if !state.closed_tabs.is_empty() {
+        let reopen = Rect::new(
+            area.x + remaining.saturating_sub(11),
+            area.y,
+            11.min(remaining),
+            1,
+        );
+        frame.render_widget(Paragraph::new("[T] reopen").fg(MINT), reopen);
+        view.hits
+            .push((reopen, Hit::Key(KeyEvent::from(KeyCode::Char('t')))));
+        remaining = remaining.saturating_sub(12);
+    }
+    let area = Rect::new(area.x, area.y, remaining, area.height);
     // Keep the selected tab visible; arrows and Tab reach every chunk.
     let available = area.width.saturating_sub(6);
     let mut start = 0;
@@ -831,13 +852,7 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
         let span = chip(index);
         hits.push((
             Rect::new(x, area.y + 1, span.width() as u16, 1),
-            Hit::Tab(
-                state
-                    .tabs
-                    .iter()
-                    .position(|tab| tab.id == state.chunks[index].tab_id)
-                    .unwrap_or(0),
-            ),
+            Hit::SelectTab(state.chunks[index].tab_id.clone()),
         ));
         x += span.width() as u16;
         spans.push(span);
@@ -858,7 +873,7 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
     }
 }
 
-fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32) {
+fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32, has_tabs: bool) {
     let mut lines = if area.height as usize >= logo::ANSI_FACE.len() + 3 {
         vec![Line::from(""); logo::ANSI_FACE.len()]
     } else {
@@ -873,9 +888,13 @@ fn welcome(frame: &mut ratatui::Frame, area: Rect, elapsed: f32) {
         .centered(),
     );
     lines.push(
-        Line::from("Press Space. Let the words come.")
-            .fg(MUTED)
-            .centered(),
+        Line::from(if has_tabs {
+            "Press Space. Let the words come."
+        } else {
+            "Create a tab with + to start recording."
+        })
+        .fg(MUTED)
+        .centered(),
     );
     let height = lines.len() as u16;
     let top = area.y + area.height.saturating_sub(height) / 2;

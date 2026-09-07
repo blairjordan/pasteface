@@ -96,6 +96,8 @@ pub struct State {
     #[serde(default)]
     pub tabs: Vec<TranscriptTab>,
     #[serde(default)]
+    pub closed_tabs: Vec<TranscriptTab>,
+    #[serde(default)]
     pub selected_tab: String,
     #[serde(default)]
     pub transcript_title: String,
@@ -125,6 +127,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             tabs: vec![TranscriptTab::default()],
+            closed_tabs: Vec::new(),
             selected_tab: "default".into(),
             transcript_title: String::new(),
             backend: BackendSettings::default(),
@@ -158,6 +161,8 @@ pub enum Action {
     CopyText(String),
     CreateTab(String),
     SelectTab(String),
+    CloseTab(String),
+    ReopenTab,
     RenameTab {
         id: String,
         name: String,
