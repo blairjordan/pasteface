@@ -63,6 +63,8 @@ pub enum ChunkStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Chunk {
     #[serde(default)]
+    pub tab_id: String,
+    #[serde(default)]
     pub title: String,
     pub id: String,
     pub status: ChunkStatus,
@@ -73,7 +75,28 @@ pub struct Chunk {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TranscriptTab {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub prior_transcript: String,
+}
+impl Default for TranscriptTab {
+    fn default() -> Self {
+        Self {
+            id: "default".into(),
+            name: "Transcript 1".into(),
+            prior_transcript: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct State {
+    #[serde(default)]
+    pub tabs: Vec<TranscriptTab>,
+    #[serde(default)]
+    pub selected_tab: String,
     #[serde(default)]
     pub transcript_title: String,
     #[serde(default)]
@@ -101,6 +124,8 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            tabs: vec![TranscriptTab::default()],
+            selected_tab: "default".into(),
             transcript_title: String::new(),
             backend: BackendSettings::default(),
             phase: Phase::Idle,
@@ -130,8 +155,11 @@ pub enum Action {
     Copy,
     CopyLatest,
     CopyChunk(String),
+    CopyText(String),
+    CreateTab(String),
+    SelectTab(String),
     RenameTab {
-        id: Option<String>,
+        id: String,
         name: String,
     },
     Clear,

@@ -75,18 +75,20 @@ Run `pasteface` to open the terminal interface and start the tray companion.
 | Key | Action |
 | --- | --- |
 | **Space** | Start or stop recording; stopping enqueues the chunk |
-| **C** | Copy the combined transcript |
+| **C** | Copy the selected tab’s transcript |
 | **Ctrl+C** | Copy only the latest completed chunk |
-| **X** | Clear saved recordings and transcript after confirmation |
+| **X** | Clear the selected tab’s recordings and transcript after confirmation |
 | **S** | Open settings, including microphone selection |
 | **Tab / Shift+Tab** | Switch transcript tabs |
+| **+** | Create a transcript tab |
+| **F2** | Rename the selected tab |
 | **↑ / ↓** | Scroll the transcript |
 | **Esc** | Cancel active transcription and all queued chunks |
 | **Q** | Close the terminal interface |
 
-Click tabs to switch between the combined transcript and individual chunks. Click a queue block to open that chunk, or use **Copy chunk** in its transcript header. Tabs also support **[ / ]** navigation. Right-click a tab and choose **Rename**, or press **F2**, to give it a persistent name.
+Click **+** to create a named transcript tab. New recordings append to the selected tab; recording a chunk never creates a tab. Click a tab to switch transcripts, or click a queue block to open its owning tab. Tabs also support **[ / ]** navigation. Right-click a tab and choose **Rename**, or press **F2**, to give it a persistent name.
 
-Click the footer controls to record, copy, clear, cancel, or open settings. Settings and the microphone picker support clicks and the mouse wheel. Scroll over the transcript with the wheel; hold **Shift** while dragging to use native text selection in terminals such as Alacritty.
+Click the footer controls to record, copy, clear, cancel, or open settings. Settings and the microphone picker support clicks and the mouse wheel. Scroll over the transcript with the wheel. Drag across transcript text to highlight and copy it; hold **Shift** while dragging to use native terminal selection instead.
 
 The microphone meter responds to your voice while recording. Queue blocks show each chunk's duration and whether it is queued, transcribing, completed, failed, or canceled.
 

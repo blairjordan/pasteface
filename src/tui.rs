@@ -3,6 +3,7 @@ use crate::{
     ipc::Client,
     logo,
     model::{Action, ChunkStatus, Phase, State, timestamp},
+    selection::Selection,
     settings_ui::SettingsView,
     tab_menu::{self, TabMenu},
 };
@@ -48,7 +49,6 @@ enum Hit {
     Key(KeyEvent),
     Tab(usize),
     Microphone(usize),
-    Command(Action),
 }
 #[derive(Default)]
 struct View {
@@ -57,6 +57,8 @@ struct View {
     hits: Vec<(Rect, Hit)>,
     tab: usize,
     transcript_area: Rect,
+    selection: Option<Selection>,
+    text_cells: Vec<Vec<String>>,
     copies: u64,
     copied_until: Option<Instant>,
     scroll: u16,
@@ -67,6 +69,7 @@ struct View {
 
 fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<()> {
     let mut view = View::default();
+    let mut sampled_at = Instant::now();
     loop {
         let (state, error) = client.snapshot();
         let copies = client.copies();
@@ -79,11 +82,18 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
         } else {
             0
         };
-        view.levels.push_back(level);
-        if view.levels.len() > 80 {
-            view.levels.pop_front();
+        if sampled_at.elapsed() >= Duration::from_millis(80) {
+            view.levels.push_back(level);
+            if view.levels.len() > 160 {
+                view.levels.pop_front();
+            }
+            sampled_at = Instant::now();
         }
-        view.tab = view.tab.min(state.chunks.len());
+        view.tab = state
+            .tabs
+            .iter()
+            .position(|tab| tab.id == state.selected_tab)
+            .unwrap_or(0);
         terminal.draw(|f| draw(f, &state, error.as_deref(), &mut view))?;
         if event::poll(Duration::from_millis(80))? {
             let event = event::read()?;
@@ -122,6 +132,21 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                         continue;
                     }
                     match mouse.kind {
+                        MouseEventKind::Drag(MouseButton::Left) if view.microphone.is_none() => {
+                            if let Some(selection) = &mut view.selection {
+                                selection.drag(mouse.column, mouse.row, view.transcript_area);
+                            }
+                            continue;
+                        }
+                        MouseEventKind::Up(MouseButton::Left) if view.microphone.is_none() => {
+                            if let Some(selection) = &view.selection {
+                                let text = selection.text(&view.text_cells, view.transcript_area);
+                                if !text.is_empty() {
+                                    client.send(Action::CopyText(text));
+                                }
+                            }
+                            continue;
+                        }
                         MouseEventKind::Down(MouseButton::Right) if view.microphone.is_none() => {
                             if let Some((_, Hit::Tab(tab))) =
                                 view.hits.iter().rev().find(|(rect, _)| {
@@ -145,6 +170,7 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                                 .transcript_area
                                 .contains((mouse.column, mouse.row).into())
                             {
+                                view.selection = None;
                                 view.scroll = if up {
                                     view.scroll.saturating_sub(3)
                                 } else {
@@ -156,6 +182,16 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                             }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
+                            if view.microphone.is_none()
+                                && !state.transcript.is_empty()
+                                && view
+                                    .transcript_area
+                                    .contains((mouse.column, mouse.row).into())
+                            {
+                                view.selection = Some(Selection::new(mouse.column, mouse.row));
+                                continue;
+                            }
+                            view.selection = None;
                             let hit = view
                                 .hits
                                 .iter()
@@ -166,6 +202,9 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                                 Some(Hit::Key(key)) => key,
                                 Some(Hit::Tab(tab)) => {
                                     view.tab = tab;
+                                    if let Some(tab) = state.tabs.get(tab) {
+                                        client.send(Action::SelectTab(tab.id.clone()));
+                                    }
                                     view.scroll = 0;
                                     continue;
                                 }
@@ -176,10 +215,6 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                                             .and_then(|i| state.devices.get(i).cloned()),
                                     ));
                                     view.microphone = None;
-                                    continue;
-                                }
-                                Some(Hit::Command(action)) => {
-                                    client.send(action);
                                     continue;
                                 }
                                 None => {
@@ -197,6 +232,7 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            view.selection = None;
             if view.microphone.is_none()
                 && let Some(settings) = &mut view.settings
             {
@@ -237,23 +273,33 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
                 continue;
             }
             let action = match key.code {
+                KeyCode::Char('+') => {
+                    view.tab_menu = Some(TabMenu::create());
+                    None
+                }
                 KeyCode::F(2) => {
                     view.tab_menu = Some(TabMenu::new(&state, view.tab, (0, 0), true));
                     None
                 }
                 KeyCode::Char(']') | KeyCode::Tab => {
-                    view.tab = (view.tab + 1) % (state.chunks.len() + 1);
+                    view.tab = (view.tab + 1) % state.tabs.len().max(1);
                     view.scroll = 0;
-                    None
+                    state
+                        .tabs
+                        .get(view.tab)
+                        .map(|tab| Action::SelectTab(tab.id.clone()))
                 }
                 KeyCode::Char('[') | KeyCode::BackTab => {
                     view.tab = if view.tab == 0 {
-                        state.chunks.len()
+                        state.tabs.len().saturating_sub(1)
                     } else {
                         view.tab - 1
                     };
                     view.scroll = 0;
-                    None
+                    state
+                        .tabs
+                        .get(view.tab)
+                        .map(|tab| Action::SelectTab(tab.id.clone()))
                 }
                 KeyCode::Char('s') => {
                     view.settings = Some(SettingsView::new(state.backend.clone()));
@@ -322,10 +368,10 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     }
     let shortcuts = shortcuts(frame.area().width.saturating_sub(2));
     let rows = Layout::vertical([
-        Constraint::Length(u16::from(!state.chunks.is_empty())),
+        Constraint::Length(1),
         Constraint::Min(4),
         Constraint::Length(if state.phase == Phase::Recording {
-            6
+            7
         } else {
             4
         }),
@@ -336,30 +382,19 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     .horizontal_margin(1)
     .vertical_margin(0)
     .split(frame.area());
-    view.transcript_area = rows[1];
-    if !state.chunks.is_empty() {
-        transcript_tabs(frame, state, view, rows[0]);
-    }
-    let selected = view.tab.checked_sub(1).and_then(|i| state.chunks.get(i));
-    let transcript = selected.map_or(state.transcript.as_str(), |chunk| chunk.text.as_str());
-    if transcript.is_empty() && !state.phase.busy() && selected.is_none() {
+    view.transcript_area = Rect::new(
+        rows[1].x,
+        rows[1].y + 1,
+        rows[1].width,
+        rows[1].height.saturating_sub(1),
+    );
+    transcript_tabs(frame, state, view, rows[0]);
+    let transcript = state.transcript.as_str();
+    if transcript.is_empty() && !state.phase.busy() {
         welcome(frame, rows[1]);
     } else {
         let text = if transcript.is_empty() {
-            selected.map_or(
-                "Your words will appear here after you stop recording.",
-                |chunk| match chunk.status {
-                    ChunkStatus::Recording => "Recording this chunk…",
-                    ChunkStatus::Queued => "Waiting for transcription…",
-                    ChunkStatus::Transcribing => "Transcribing this chunk…",
-                    ChunkStatus::Canceled => "Transcription canceled. Audio retained.",
-                    ChunkStatus::Failed => chunk
-                        .error
-                        .as_deref()
-                        .unwrap_or("Transcription failed. Audio retained."),
-                    ChunkStatus::Ready => "No speech detected in this chunk.",
-                },
-            )
+            "Your words will appear here after you stop recording."
         } else {
             transcript
         };
@@ -384,17 +419,16 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             rows[1],
         );
     }
-    if let Some(chunk) = selected.filter(|chunk| !chunk.text.is_empty()) {
-        let label = "[Copy chunk]";
-        let area = Rect::new(
-            rows[1].right().saturating_sub(label.len() as u16),
-            rows[1].y,
-            label.len() as u16,
-            1,
-        );
-        frame.render_widget(Paragraph::new(label).fg(MINT), area);
-        view.hits
-            .push((area, Hit::Command(Action::CopyChunk(chunk.id.clone()))));
+    let text_area = view.transcript_area;
+    view.text_cells = (text_area.y..text_area.bottom())
+        .map(|y| {
+            (text_area.x..text_area.right())
+                .map(|x| frame.buffer_mut()[(x, y)].symbol().to_owned())
+                .collect()
+        })
+        .collect();
+    if let Some(selection) = &view.selection {
+        selection.paint(frame.buffer_mut(), text_area);
     }
     let color = match state.phase {
         Phase::Recording | Phase::Error => Color::Rgb(255, 124, 139),
@@ -465,7 +499,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
             rows[2].width.saturating_sub(4),
             rows[2].height - 4,
         );
-        let count = (inner.width / 4) as usize;
+        let count = (inner.width / 3) as usize;
         let values = view
             .levels
             .iter()
@@ -476,17 +510,35 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         let bars = values
             .iter()
             .rev()
-            .map(|v| Bar::default().value(*v).text_value(String::new()))
+            .enumerate()
+            .map(|(i, v)| {
+                Bar::default()
+                    .value(*v)
+                    .text_value(String::new())
+                    .style(Style::default().fg(logo::gradient(i, values.len())))
+            })
             .collect::<Vec<_>>();
         frame.render_widget(
             BarChart::default()
                 .data(BarGroup::default().bars(&bars))
                 .max(100)
-                .bar_width(3)
+                .bar_width(2)
                 .bar_gap(1)
                 .bar_style(Style::default().fg(MINT)),
             inner,
         );
+        // Shade each bar vertically; its height and time history remain unchanged.
+        for y in inner.y..inner.bottom() {
+            let t = (y - inner.y) as f32 / inner.height.saturating_sub(1).max(1) as f32;
+            let tint = Color::Rgb(
+                (190. - 110. * t) as u8,
+                (245. - 115. * t) as u8,
+                (209. + 36. * t) as u8,
+            );
+            for x in inner.x..inner.right() {
+                frame.buffer_mut()[(x, y)].set_fg(tint);
+            }
+        }
     }
     let mic_area = Rect::new(
         rows[2].x + 2,
@@ -518,7 +570,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
         );
     }
     let notice = if view.confirm {
-        "Clear transcript and saved audio? [X] confirm · [Esc] dismiss"
+        "Clear this tab and its audio? [X] confirm · [Esc] dismiss"
     } else {
         error.unwrap_or(
             if copied || state.phase.busy() || state.message == "Copied to clipboard." {
@@ -589,21 +641,21 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     }
 }
 fn transcript_tabs(frame: &mut ratatui::Frame, state: &State, view: &mut View, area: Rect) {
-    let labels = (0..=state.chunks.len())
+    let labels = (0..state.tabs.len())
         .map(|tab| {
             let name = tab_menu::title(state, tab);
-            let short = if name.chars().count() > 18 {
+            if name.chars().count() > 18 {
                 format!("{}…", name.chars().take(17).collect::<String>())
             } else {
                 name
-            };
-            if tab == 0 {
-                short
-            } else {
-                format!("{short} · {}", timestamp(state.chunks[tab - 1].seconds))
             }
         })
         .collect::<Vec<_>>();
+    let plus = Rect::new(area.right().saturating_sub(3), area.y, 3, 1);
+    frame.render_widget(Paragraph::new(" + ").fg(MINT).bold(), plus);
+    view.hits
+        .push((plus, Hit::Key(KeyEvent::from(KeyCode::Char('+')))));
+    let area = Rect::new(area.x, area.y, area.width.saturating_sub(4), area.height);
     // Keep the selected tab visible; arrows and Tab reach every chunk.
     let available = area.width.saturating_sub(6);
     let mut start = 0;
@@ -757,7 +809,13 @@ fn queue(frame: &mut ratatui::Frame, state: &State, area: Rect, hits: &mut Vec<(
         let span = chip(index);
         hits.push((
             Rect::new(x, area.y + 1, span.width() as u16, 1),
-            Hit::Tab(index + 1),
+            Hit::Tab(
+                state
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == state.chunks[index].tab_id)
+                    .unwrap_or(0),
+            ),
         ));
         x += span.width() as u16;
         spans.push(span);
@@ -784,8 +842,7 @@ fn welcome(frame: &mut ratatui::Frame, area: Rect) {
             .iter()
             .enumerate()
             .map(|(i, line)| {
-                let step = (i * 10 / (logo::ANSI_FACE.len() - 1).max(1)) as u8;
-                let tint = Color::Rgb(190 - step * 8, 245 - step * 7, 209 + step * 3);
+                let tint = logo::gradient(i, logo::ANSI_FACE.len());
                 Line::from(*line).fg(tint).centered()
             })
             .collect::<Vec<_>>()
@@ -881,6 +938,7 @@ mod tests {
             ChunkStatus::Canceled,
         ] {
             state.chunks.push(crate::model::Chunk {
+                tab_id: "default".into(),
                 title: String::new(),
                 id: String::new(),
                 status,
@@ -938,6 +996,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, text)| crate::model::Chunk {
+                    tab_id: "default".into(),
                     title: String::new(),
                     id: format!("chunk-{i}"),
                     text: (*text).into(),
@@ -949,7 +1008,7 @@ mod tests {
             ..State::default()
         };
         let mut view = View {
-            tab: 2,
+            tab: 0,
             ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -962,13 +1021,8 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains("Second thought."));
-        assert!(!text.contains("First thought."));
-        assert!(view.hits.iter().any(|(_, hit)| matches!(hit, Hit::Tab(1))));
-        assert!(
-            view.hits.iter().any(
-                |(_, hit)| matches!(hit, Hit::Command(Action::CopyChunk(id)) if id == "chunk-1")
-            )
-        );
+        assert!(text.contains("First thought."));
+        assert!(view.hits.iter().any(|(_, hit)| matches!(hit, Hit::Tab(0))));
         for y in view.transcript_area.y..view.transcript_area.bottom() {
             assert_ne!(
                 terminal.backend().buffer()[(view.transcript_area.x, y)].symbol(),

@@ -43,22 +43,36 @@ pub fn ensure(config: &Config) -> Result<()> {
             }
         }
     }
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config.directory.join("daemon.log"))?;
-    Command::new(crate::config::executable()?)
-        .arg("daemon")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()?;
+    // A socket can disappear just before the previous daemon releases its lock.
+    // Serialize launchers and wait for that release instead of spawning a doomed child.
+    let mut spawned = false;
+    let mut launcher = None;
     for _ in 0..80 {
-        thread::sleep(Duration::from_millis(50));
         if request(config, Action::Status).is_ok() {
             return Ok(());
         }
+        if launcher.is_none() {
+            launcher = crate::service::lock(config, "startup.lock").ok();
+        }
+        if !spawned
+            && launcher.is_some()
+            && let Ok(recorder) = crate::service::lock(config, "recorder.lock")
+        {
+            drop(recorder);
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(config.directory.join("daemon.log"))?;
+            Command::new(crate::config::executable()?)
+                .arg("daemon")
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .spawn()?;
+            spawned = true;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
     anyhow::bail!(
         "Could not start recorder. See {}",
@@ -80,6 +94,7 @@ impl Client {
         let copies = Arc::new(AtomicU64::new(0));
         let copy_events = copies.clone();
         thread::spawn(move || {
+            let mut offline = false;
             loop {
                 let action = match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(a) => a,
@@ -92,17 +107,22 @@ impl Client {
                     Ok(reply) => {
                         if matches!(
                             action,
-                            Action::Copy | Action::CopyLatest | Action::CopyChunk(_)
+                            Action::Copy
+                                | Action::CopyLatest
+                                | Action::CopyChunk(_)
+                                | Action::CopyText(_)
                         ) && reply.error.is_none()
                         {
                             copy_events.fetch_add(1, Ordering::Relaxed);
                         }
                         current.0 = reply.state;
-                        if !matches!(action, Action::Status) || reply.error.is_some() {
+                        if offline || !matches!(action, Action::Status) || reply.error.is_some() {
                             current.1 = reply.error;
                         }
+                        offline = false;
                     }
                     Err(e) => {
+                        offline = true;
                         current.1 = Some(format!("Recorder offline: {e}"));
                     }
                 }

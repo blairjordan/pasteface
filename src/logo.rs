@@ -14,6 +14,16 @@ pub const ANSI_FACE: &[&str] = &[
     "  ▀▀                     ",
 ];
 
+/// Shared mint-to-blue palette for the welcome art and microphone meter.
+pub fn gradient(index: usize, count: usize) -> ratatui::style::Color {
+    let t = index.min(count.saturating_sub(1)) as f32 / count.saturating_sub(1).max(1) as f32;
+    ratatui::style::Color::Rgb(
+        (190. - 80. * t) as u8,
+        (245. - 70. * t) as u8,
+        (209. + 30. * t) as u8,
+    )
+}
+
 /// A small status circle, independent of the terminal logo.
 #[cfg(feature = "tray")]
 pub fn rgba(size: usize, phase: Phase) -> Vec<u8> {

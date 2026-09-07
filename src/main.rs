@@ -6,6 +6,7 @@ mod ipc;
 mod logo;
 mod model;
 mod provider;
+mod selection;
 mod service;
 mod settings_ui;
 mod tab_menu;

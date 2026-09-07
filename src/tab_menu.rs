@@ -17,14 +17,20 @@ pub struct TabMenu {
 impl TabMenu {
     pub fn new(state: &State, tab: usize, position: (u16, u16), renaming: bool) -> Self {
         Self {
-            id: tab
-                .checked_sub(1)
-                .and_then(|i| state.chunks.get(i))
-                .map(|c| c.id.clone()),
+            id: state.tabs.get(tab).map(|t| t.id.clone()),
             name: title(state, tab),
             position,
             renaming,
             replace: true,
+        }
+    }
+    pub fn create() -> Self {
+        Self {
+            id: None,
+            name: String::new(),
+            position: (0, 0),
+            renaming: true,
+            replace: false,
         }
     }
     fn area(&self, screen: Rect) -> Rect {
@@ -32,9 +38,9 @@ impl TabMenu {
             let width = screen.width.saturating_sub(2).min(60);
             Rect::new(
                 screen.x + (screen.width - width) / 2,
-                screen.y + screen.height.saturating_sub(5) / 2,
+                screen.y + screen.height.saturating_sub(7) / 2,
                 width,
-                5.min(screen.height),
+                7.min(screen.height),
             )
         } else {
             let width = 18.min(screen.width);
@@ -48,9 +54,15 @@ impl TabMenu {
     }
     fn save(&self) -> Option<Action> {
         let name = self.name.trim();
-        (!name.is_empty()).then(|| Action::RenameTab {
-            id: self.id.clone(),
-            name: name.into(),
+        if name.is_empty() {
+            return None;
+        }
+        Some(match &self.id {
+            Some(id) => Action::RenameTab {
+                id: id.clone(),
+                name: name.into(),
+            },
+            None => Action::CreateTab(name.into()),
         })
     }
     fn insert(&mut self, text: &str) {
@@ -82,7 +94,7 @@ impl TabMenu {
                         self.name.pop();
                     }
                 }
-                KeyCode::Char('u')
+                KeyCode::Char('u' | 'c')
                     if self.renaming && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     self.name.clear();
@@ -108,12 +120,17 @@ impl TabMenu {
                     if mouse.row == area.y + 1 {
                         self.renaming = true;
                     }
-                } else if mouse.row == area.y + 3 {
-                    if mouse.column < area.x + 10 {
+                } else if mouse.row == area.y + 5 {
+                    if mouse.column < area.x + 12 {
                         let action = self.save();
                         return (action.is_some(), action);
                     }
-                    return (true, None);
+                    if mouse.column < area.x + 24 {
+                        self.name.clear();
+                        self.replace = false;
+                    } else {
+                        return (true, None);
+                    }
                 }
             }
             _ => {}
@@ -130,34 +147,46 @@ impl TabMenu {
         if self.renaming {
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(self.name.clone()).bg(Color::Rgb(38, 66, 61)),
+                    Line::from(if self.id.is_some() {
+                        "rename tab"
+                    } else {
+                        "new tab"
+                    })
+                    .bold(),
                     Line::from(""),
-                    Line::from("[Save]   [Cancel]"),
+                    Line::from(if self.name.is_empty() {
+                        " "
+                    } else {
+                        &self.name
+                    })
+                    .bg(Color::Rgb(38, 43, 64)),
+                    Line::from(""),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            " ↵ save ",
+                            Style::default()
+                                .bg(Color::Rgb(124, 160, 247))
+                                .fg(Color::Rgb(18, 23, 30))
+                                .bold(),
+                        ),
+                        ratatui::text::Span::raw("    ^C clear    esc cancel"),
+                    ]),
                 ])
-                .block(block.title(" Rename tab · Enter saves ")),
+                .block(block.border_style(Style::default().fg(Color::Rgb(124, 160, 247)))),
                 area,
             );
+            frame.set_cursor_position((
+                (area.x + 1 + self.name.chars().count() as u16).min(area.right().saturating_sub(2)),
+                area.y + 3,
+            ));
         } else {
             frame.render_widget(Paragraph::new("Rename…").block(block), area);
         }
     }
 }
 pub fn title(state: &State, tab: usize) -> String {
-    if tab == 0 {
-        return if state.transcript_title.is_empty() {
-            "All".into()
-        } else {
-            state.transcript_title.clone()
-        };
-    }
-    state.chunks.get(tab - 1).map_or_else(
-        || "All".into(),
-        |chunk| {
-            if chunk.title.is_empty() {
-                format!("Chunk {tab}")
-            } else {
-                chunk.title.clone()
-            }
-        },
-    )
+    state
+        .tabs
+        .get(tab)
+        .map_or_else(|| "Transcript 1".into(), |tab| tab.name.clone())
 }

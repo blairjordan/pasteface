@@ -1,7 +1,7 @@
 use crate::{
     audio::Capture,
     config::Config,
-    model::{Action, BackendSettings, Chunk, ChunkStatus, Phase, Reply, State},
+    model::{Action, BackendSettings, Chunk, ChunkStatus, Phase, Reply, State, TranscriptTab},
     transcribe,
 };
 use anyhow::{Context, Result, ensure};
@@ -45,7 +45,23 @@ impl Recorder {
         if state.chunks.is_empty() && state.prior_transcript.is_empty() {
             state.prior_transcript = state.transcript.clone();
         }
+        if state.tabs.is_empty() {
+            let mut tab = TranscriptTab::default();
+            if !state.transcript_title.is_empty() {
+                tab.name = std::mem::take(&mut state.transcript_title);
+            }
+            state.tabs.push(tab);
+        }
+        if !state.tabs.iter().any(|tab| tab.id == state.selected_tab) {
+            state.selected_tab = state.tabs[0].id.clone();
+        }
+        if state.tabs[0].prior_transcript.is_empty() {
+            state.tabs[0].prior_transcript = std::mem::take(&mut state.prior_transcript);
+        }
         for chunk in &mut state.chunks {
+            if chunk.tab_id.is_empty() {
+                chunk.tab_id = state.tabs[0].id.clone();
+            }
             if chunk.seconds == 0. {
                 chunk.seconds = crate::audio::duration(
                     &config
@@ -83,6 +99,7 @@ impl Recorder {
             pending: None,
             clipboard: None,
         };
+        recorder.rebuild_transcript();
         recorder.refresh();
         Ok(recorder)
     }
@@ -91,6 +108,25 @@ impl Recorder {
             .directory
             .join("chunks")
             .join(&self.state.chunks[index].id)
+    }
+    fn rebuild_transcript(&mut self) {
+        let prior = self
+            .state
+            .tabs
+            .iter()
+            .find(|tab| tab.id == self.state.selected_tab)
+            .map_or("", |tab| tab.prior_transcript.as_str());
+        self.state.transcript = std::iter::once(prior)
+            .chain(
+                self.state
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.tab_id == self.state.selected_tab)
+                    .map(|chunk| chunk.text.as_str()),
+            )
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
     }
     fn refresh(&mut self) {
         self.state.queue_depth = self
@@ -166,17 +202,13 @@ impl Recorder {
                         self.state.chunks[index].text = text;
                         self.state.chunks[index].status = ChunkStatus::Ready;
                         self.state.chunks[index].error = None;
-                        self.state.transcript =
-                            std::iter::once(self.state.prior_transcript.as_str())
-                                .chain(self.state.chunks.iter().map(|c| c.text.as_str()))
-                                .filter(|s| !s.is_empty())
-                                .collect::<Vec<_>>()
-                                .join("\n");
+                        self.rebuild_transcript();
                         self.state.message = format!(
                             "Chunk {} transcribed. Keep going whenever you're ready.",
                             index + 1
                         );
-                        if std::env::var("PASTEFACE_AUTO_COPY").as_deref() != Ok("0")
+                        if self.state.chunks[index].tab_id == self.state.selected_tab
+                            && std::env::var("PASTEFACE_AUTO_COPY").as_deref() != Ok("0")
                             && !self.state.transcript.is_empty()
                             && let Err(e) = self.copy()
                         {
@@ -237,6 +269,7 @@ impl Recorder {
         let directory = self.config.directory.join("chunks").join(&id);
         fs::create_dir_all(directory)?;
         self.state.chunks.push(Chunk {
+            tab_id: self.state.selected_tab.clone(),
             title: String::new(),
             id,
             status,
@@ -424,24 +457,38 @@ impl Recorder {
                 };
             }
             Action::Copy => self.copy()?,
-            Action::RenameTab { id, name } => {
-                let name = name.trim();
-                ensure!(
-                    !name.is_empty()
-                        && name.chars().count() <= 48
-                        && !name.chars().any(char::is_control),
-                    "Tab names must contain 1–48 printable characters."
+            Action::CopyText(text) => self.copy_text(text)?,
+            Action::CreateTab(name) => {
+                validate_tab_name(&name)?;
+                let id = format!(
+                    "tab-{}",
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
                 );
-                if let Some(id) = id {
-                    self.state
-                        .chunks
-                        .iter_mut()
-                        .find(|chunk| chunk.id == id)
-                        .context("Chunk is no longer available.")?
-                        .title = name.into();
-                } else {
-                    self.state.transcript_title = name.into();
-                }
+                self.state.tabs.push(TranscriptTab {
+                    id: id.clone(),
+                    name: name.trim().into(),
+                    prior_transcript: String::new(),
+                });
+                self.state.selected_tab = id;
+                self.rebuild_transcript();
+                self.state.message = "Tab created.".into();
+            }
+            Action::SelectTab(id) => {
+                ensure!(
+                    self.state.tabs.iter().any(|tab| tab.id == id),
+                    "Tab is no longer available."
+                );
+                self.state.selected_tab = id;
+                self.rebuild_transcript();
+            }
+            Action::RenameTab { id, name } => {
+                validate_tab_name(&name)?;
+                self.state
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == id)
+                    .context("Tab is no longer available.")?
+                    .name = name.trim().into();
                 self.state.message = "Tab renamed.".into();
             }
             Action::CopyChunk(id) => {
@@ -461,7 +508,11 @@ impl Recorder {
                     .chunks
                     .iter()
                     .rev()
-                    .find(|chunk| chunk.status == ChunkStatus::Ready && !chunk.text.is_empty())
+                    .find(|chunk| {
+                        chunk.tab_id == self.state.selected_tab
+                            && chunk.status == ChunkStatus::Ready
+                            && !chunk.text.is_empty()
+                    })
                     .context("No completed chunk to copy yet.")?
                     .text
                     .clone();
@@ -472,9 +523,16 @@ impl Recorder {
                     self.capture.is_none() && self.pending.is_none() && self.state.queue_depth == 0,
                     "Finish recording and let the queue drain before clearing."
                 );
-                let chunks = self.config.directory.join("chunks");
-                if chunks.exists() {
-                    fs::remove_dir_all(chunks)?;
+                for chunk in self
+                    .state
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.tab_id == self.state.selected_tab)
+                {
+                    let path = self.config.directory.join("chunks").join(&chunk.id);
+                    if path.exists() {
+                        fs::remove_dir_all(path)?;
+                    }
                 }
                 for name in [
                     "capture.wav",
@@ -487,8 +545,21 @@ impl Recorder {
                         fs::remove_file(path)?;
                     }
                 }
-                self.state.chunks.clear();
-                self.state.transcript_title.clear();
+                self.state
+                    .chunks
+                    .retain(|chunk| chunk.tab_id != self.state.selected_tab);
+                if let Some(tab) = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == self.state.selected_tab)
+                {
+                    tab.prior_transcript.clear();
+                }
+                let chunks = self.config.directory.join("chunks");
+                if chunks.is_dir() && fs::read_dir(&chunks)?.next().is_none() {
+                    fs::remove_dir(chunks)?;
+                }
                 self.state.transcript.clear();
                 self.state.prior_transcript.clear();
                 self.state.seconds = 0.;
@@ -503,6 +574,15 @@ impl Recorder {
         self.save()?;
         self.start_next()
     }
+}
+fn validate_tab_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.trim().is_empty()
+            && name.chars().count() <= 48
+            && !name.chars().any(char::is_control),
+        "Tab names must contain 1–48 printable characters."
+    );
+    Ok(())
 }
 pub fn lock(config: &Config, name: &str) -> Result<File> {
     let file = OpenOptions::new()
@@ -719,27 +799,33 @@ mod tests {
         );
     }
     #[test]
-    fn tab_names_survive_restart_without_changing_text() {
+    fn explicit_tabs_keep_chunks_together_and_survive_restart() {
         let (_temp, mut recorder) = setup();
-        let index = recorder.add_chunk(ChunkStatus::Ready).unwrap();
-        recorder.state.chunks[index].text = "Saved words".into();
-        let id = recorder.state.chunks[index].id.clone();
+        let first = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[first].text = "First words".into();
+        let next = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[next].text = "More words".into();
+        assert_eq!(recorder.state.tabs.len(), 1);
+        recorder.action(Action::CreateTab("Notes".into())).unwrap();
+        assert!(recorder.state.transcript.is_empty());
+        let tab = recorder.state.selected_tab.clone();
+        let second = recorder.add_chunk(ChunkStatus::Ready).unwrap();
+        recorder.state.chunks[second].text = "Separate words".into();
         recorder
             .action(Action::RenameTab {
-                id: Some(id),
+                id: tab,
                 name: "Meeting notes".into(),
             })
             .unwrap();
         recorder
-            .action(Action::RenameTab {
-                id: None,
-                name: "Combined".into(),
-            })
+            .action(Action::SelectTab("default".into()))
             .unwrap();
+        assert_eq!(recorder.state.transcript, "First words\nMore words");
         let restored = Recorder::new(recorder.config.clone()).unwrap();
-        assert_eq!(restored.state.chunks[index].title, "Meeting notes");
-        assert_eq!(restored.state.chunks[index].text, "Saved words");
-        assert_eq!(restored.state.transcript_title, "Combined");
+        assert_eq!(restored.state.tabs.len(), 2);
+        assert_eq!(restored.state.tabs[1].name, "Meeting notes");
+        assert_eq!(restored.state.transcript, "First words\nMore words");
+        assert_eq!(restored.state.chunks[second].text, "Separate words");
     }
     #[test]
     fn lock_prevents_two_recorders() {
