@@ -6,11 +6,9 @@ Pasteface is a Rust application built with Ratatui. It combines a dark terminal 
 
 Press **Space** to record, then **Space** again to enqueue the recording. Start another recording immediately while transcription runs in the background. Each completed chunk appends to the transcript on a new line and copies the combined text to your clipboard.
 
-## Screenshots
+## Screenshot
 
 ![Pasteface welcome screen](docs/images/welcome.png)
-
-![Recording with the microphone meter and chunk queue](docs/images/recording.png)
 
 ## Installation
 
