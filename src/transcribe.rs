@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-/// Resample the complete recording once; Whisper retains its full context.
+/// Resample the complete recording once, then transcribe its audio windows.
 pub fn run(config: &Config, directory: &Path, canceled: &AtomicBool) -> Result<String> {
     ensure!(!canceled.load(Ordering::Acquire), "Transcription canceled");
     config.check_model()?;
@@ -42,7 +42,9 @@ pub fn run(config: &Config, directory: &Path, canceled: &AtomicBool) -> Result<S
         .arg(&config.model)
         .arg("-f")
         .arg(&audio)
-        .args(["-nt", "-otxt", "-of"])
+        // Prior generated text can reinforce hallucinated repetition in later
+        // audio windows. Keep decoding grounded in each window's audio.
+        .args(["--max-context", "0", "-nt", "-otxt", "-of"])
         .arg(output_path);
     if config.acceleration == crate::config::Acceleration::Cpu {
         whisper.arg("-ng");
@@ -93,7 +95,68 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::Arc, time::Instant};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Instant};
+
+    #[test]
+    fn local_transcription_disables_context_and_preserves_repeated_speech() {
+        let temp = tempfile::Builder::new()
+            .prefix("pasteface transcription ")
+            .tempdir()
+            .unwrap();
+        let directory = temp.path();
+        let binary = directory.join("fake whisper");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+set -eu
+context=missing
+output=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --max-context) context="$2"; shift 2 ;;
+        -of) output="$2"; shift 2 ;;
+        -m|-f) test -f "$2"; shift 2 ;;
+        -nt|-otxt|-ng) shift ;;
+        *) echo "Unexpected argument: $1" >&2; exit 1 ;;
+    esac
+done
+test "$context" = 0 || { echo 'Rolling context must be disabled' >&2; exit 1; }
+printf 'I want you to look at it. I want you to look at it.\n' > "$output.txt"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let model = directory.join("model $literal.bin");
+        fs::write(&model, "fixture").unwrap();
+        let mut audio = hound::WavWriter::create(
+            directory.join("recording.wav"),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..1600 {
+            audio.write_sample(0_i16).unwrap();
+        }
+        audio.finalize().unwrap();
+        let config = Config {
+            directory: directory.into(),
+            binary,
+            model,
+            device: None,
+            whisper_environment: Default::default(),
+            provider: crate::config::Provider::Local,
+            acceleration: crate::config::Acceleration::Auto,
+            openai_model: "unused".into(),
+        };
+        assert_eq!(
+            run(&config, directory, &AtomicBool::new(false)).unwrap(),
+            "I want you to look at it. I want you to look at it."
+        );
+    }
 
     #[test]
     fn cancellation_kills_and_reaps_running_process_promptly() {
