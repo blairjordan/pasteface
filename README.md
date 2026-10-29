@@ -212,8 +212,11 @@ saved locally and does not alter recorded transcripts.
 Install the local engine and voice once with `scripts/install-tts.sh` (requires
 Python or uv and an internet connection for installation). Linux playback uses
 `ffplay` from FFmpeg; macOS uses `afplay`. After setup, synthesis and playback run
-offline without an account or paid API. Kokoro model weights are Apache-2.0; the kokoro-onnx runtime is MIT. Generated WAVs and speech input text
-are retained under the state directory's `speech/` folder. Closing or switching
+offline without an account or paid API. Kokoro model weights are Apache-2.0; the kokoro-onnx runtime is MIT. Speech is generated in complete sentence chunks, with playback starting as soon
+as the first is ready while the rest continues generating. The status shows
+loading, generated/total parts, elapsed generation time, and the playing part.
+Played chunks are deleted after successful playback; unplayed chunks and input
+text remain under the state directory's `speech/` folder. Closing or switching
 modes stops playback; microphone capture continues independently in the daemon.
 
 Launch the installed app with `~/.local/bin/pasteface tui --no-tray`. Closing the

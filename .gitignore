@@ -1,3 +1,6 @@
 /target/
 *.log
 .learnings/
+
+# Python test bytecode
+__pycache__/

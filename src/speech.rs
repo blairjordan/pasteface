@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -18,7 +18,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct Playback {
@@ -56,6 +56,7 @@ pub struct SpeechView {
     stop_area: Rect,
     voice_area: Rect,
     generating: bool,
+    generation_started: Option<Instant>,
 }
 impl SpeechView {
     pub fn new(directory: PathBuf) -> Self {
@@ -87,6 +88,7 @@ impl SpeechView {
             stop_area: Rect::default(),
             voice_area: Rect::default(),
             generating: false,
+            generation_started: None,
         }
     }
     pub fn stop(&mut self) {
@@ -103,7 +105,10 @@ impl SpeechView {
                 .as_ref()
                 .is_some_and(|worker| worker.is_finished());
             for update in playback.updates.try_iter() {
-                self.generating = false;
+                self.generating = update.starts_with("Generating speech locally")
+                    || update.starts_with("Loading local voice")
+                    || update.contains("generating")
+                    || update.starts_with("Buffering");
                 self.message = update;
             }
             if finished {
@@ -159,6 +164,7 @@ impl SpeechView {
         let (send, updates) = mpsc::channel();
         self.message = "Generating speech locally".into();
         self.generating = true;
+        self.generation_started = Some(Instant::now());
         let worker = thread::spawn(move || {
             let result = speak(&root, &text, voice, &canceled, &send);
             let message = match result {
@@ -334,7 +340,12 @@ impl SpeechView {
             rows[1],
         );
         let message = if self.generating {
-            let label = "Generating speech locally";
+            let label = format!(
+                "{} · {}s elapsed · Esc stops",
+                self.message,
+                self.generation_started
+                    .map_or(0, |started| started.elapsed().as_secs())
+            );
             Line::from(
                 label
                     .chars()
@@ -413,8 +424,14 @@ fn vertical_cursor(text: &str, cursor: usize, up: bool) -> usize {
             .nth(column)
             .map_or(line.len(), |(i, _)| i)
 }
-fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
-    ensure!(!canceled.load(Ordering::Acquire), "Playback stopped");
+struct SpeechProcess(std::process::Child);
+impl Drop for SpeechProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn spawn_speech(command: &mut Command) -> Result<SpeechProcess> {
     // Also stop audio after an abrupt UI death where Rust destructors cannot run.
     #[cfg(target_os = "linux")]
     {
@@ -434,16 +451,17 @@ fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
             });
         }
     }
-    let mut child = command
+    let child = command
         .spawn()
         .context("Could not start local speech process")?;
+    Ok(SpeechProcess(child))
+}
+#[cfg(test)]
+fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
+    let mut child = spawn_speech(command)?;
     loop {
-        if canceled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("Playback stopped");
-        }
-        if let Some(status) = child.try_wait()? {
+        ensure!(!canceled.load(Ordering::Acquire), "Playback stopped");
+        if let Some(status) = child.0.try_wait()? {
             ensure!(
                 status.success(),
                 "Local speech process exited with {status}"
@@ -451,6 +469,137 @@ fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+#[derive(serde::Deserialize)]
+struct SpeechProgress {
+    stage: String,
+    completed: usize,
+    total: usize,
+}
+impl SpeechProgress {
+    fn message(&self) -> String {
+        if self.stage == "loading" {
+            return "Loading local voice".into();
+        }
+        let total = self.total.max(1);
+        let completed = self.completed.min(total);
+        format!(
+            "Generating speech locally · {completed}/{total} parts · {}%",
+            completed * 100 / total
+        )
+    }
+}
+fn player_command(audio: &Path, directory: &Path) -> Result<Command> {
+    #[cfg(target_os = "macos")]
+    let mut player = Command::new("afplay");
+    #[cfg(not(target_os = "macos"))]
+    let mut player = {
+        let mut command = Command::new("ffplay");
+        command.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
+        command
+    };
+    player
+        .arg(audio)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("playback.log"))?,
+        ));
+    Ok(player)
+}
+// Both processes live in this scope: errors and cancellation stop and reap both.
+fn stream_speech(
+    command: &mut Command,
+    directory: &Path,
+    canceled: &AtomicBool,
+    updates: &mpsc::Sender<String>,
+) -> Result<()> {
+    stream_speech_with_player(command, directory, canceled, updates, player_command)
+}
+fn stream_speech_with_player(
+    command: &mut Command,
+    directory: &Path,
+    canceled: &AtomicBool,
+    updates: &mpsc::Sender<String>,
+    make_player: impl Fn(&Path, &Path) -> Result<Command>,
+) -> Result<()> {
+    ensure!(!canceled.load(Ordering::Acquire), "Playback stopped");
+    let mut synthesis = spawn_speech(command)?;
+    let mut player: Option<SpeechProcess> = None;
+    let mut next = 0;
+    let mut finished = false;
+    let mut progress: Option<SpeechProgress> = None;
+    let mut last_message = String::new();
+    loop {
+        ensure!(!canceled.load(Ordering::Acquire), "Playback stopped");
+        if let Ok(data) = fs::read(directory.join("speech.progress.json"))
+            && let Ok(update) = serde_json::from_slice::<SpeechProgress>(&data)
+        {
+            progress = Some(update);
+        }
+        let part = directory.join(format!("part-{next:06}.wav"));
+        if let Some(active) = player.as_mut()
+            && let Some(status) = active.0.try_wait()?
+        {
+            ensure!(
+                status.success(),
+                "Playback failed with {status}; unplayed audio retained"
+            );
+            player = None;
+            fs::remove_file(&part).context("Could not delete played speech chunk")?;
+            next += 1;
+        }
+        let part = directory.join(format!("part-{next:06}.wav"));
+        if player.is_none() && part.is_file() {
+            player = Some(spawn_speech(&mut make_player(&part, directory)?)?);
+        }
+        if !finished && let Some(status) = synthesis.0.try_wait()? {
+            ensure!(
+                status.success(),
+                "Speech synthesis failed with {status}; see retained synthesis.log"
+            );
+            finished = true;
+        }
+        let message = if let Some(progress) = &progress {
+            if player.is_some() {
+                let generating = if progress.completed < progress.total {
+                    format!(" · generating {}/{}", progress.completed, progress.total)
+                } else {
+                    " · all audio ready".into()
+                };
+                format!(
+                    "Playing part {}/{}{} · Esc stops",
+                    next + 1,
+                    progress.total,
+                    generating
+                )
+            } else if next > 0 && !finished {
+                format!("Buffering part {} · {}", next + 1, progress.message())
+            } else {
+                progress.message()
+            }
+        } else {
+            "Loading local voice".into()
+        };
+        if message != last_message {
+            let _ = updates.send(message.clone());
+            last_message = message;
+        }
+        if finished && player.is_none() && !part.is_file() {
+            let final_progress: SpeechProgress =
+                serde_json::from_slice(&fs::read(directory.join("speech.progress.json"))?)?;
+            ensure!(
+                final_progress.stage == "done" && next == final_progress.total,
+                "Speech process finished with missing chunks; unplayed audio retained"
+            );
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(40));
     }
 }
 fn speak(
@@ -485,7 +634,7 @@ fn speak(
     file.write_all(text.as_bytes())?;
     drop(file);
     let audio = directory.join("speech.wav");
-    wait(
+    stream_speech(
         Command::new(python)
             .args(["-c", include_str!("../scripts/synthesize.py")])
             .arg(voices)
@@ -494,39 +643,100 @@ fn speak(
             .stdin(File::open(input)?)
             .stdout(Stdio::null())
             .stderr(Stdio::from(File::create(directory.join("synthesis.log"))?)),
+        &directory,
         canceled,
+        updates,
     )
-    .context(
-        "Speech synthesis failed; see the retained speech/synthesis.log in the state directory",
-    )?;
-    let _ = updates.send("Playing aloud · Esc stops playback".into());
-    #[cfg(target_os = "macos")]
-    let mut player = {
-        let mut c = Command::new("afplay");
-        c.arg(&audio);
-        c
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mut player = {
-        let mut c = Command::new("ffplay");
-        c.args(["-nodisp", "-autoexit", "-loglevel", "error"])
-            .arg(&audio);
-        c
-    };
-    wait(
-        player
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(File::create(directory.join("playback.log"))?)),
-        canceled,
-    )
-    .context("Audio playback failed; install ffplay (ffmpeg) and check your output device")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    #[test]
+    fn first_chunk_plays_before_synthesis_finishes_and_played_files_are_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut synth = Command::new("sh");
+        synth.current_dir(root).args([
+            "-c",
+            r#"
+            printf '{"stage":"generating","completed":1,"total":2}' > speech.progress.json
+            touch part-000000.wav
+            while [ ! -f first-played ]; do sleep 0.02; done
+            test ! -f part-000000.wav || sleep 0.1
+            touch part-000001.wav
+            printf '{"stage":"done","completed":2,"total":2}' > speech.progress.json
+        "#,
+        ]);
+        let (send, updates) = mpsc::channel();
+        stream_speech_with_player(
+            &mut synth,
+            root,
+            &AtomicBool::new(false),
+            &send,
+            |audio, directory| {
+                let mut player = Command::new("sh");
+                player
+                    .current_dir(directory)
+                    .args([
+                        "-c",
+                        "test -f \"$1\"; echo \"$1\" >> played; touch first-played",
+                        "player",
+                    ])
+                    .arg(audio);
+                Ok(player)
+            },
+        )
+        .unwrap();
+        assert!(!root.join("part-000000.wav").exists());
+        assert!(!root.join("part-000001.wav").exists());
+        let played = fs::read_to_string(root.join("played")).unwrap();
+        let lines: Vec<_> = played.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("part-000000.wav"));
+        assert!(lines[1].ends_with("part-000001.wav"));
+        assert!(
+            updates
+                .try_iter()
+                .any(|message| message.contains("Playing part 1/2"))
+        );
+    }
+
+    #[test]
+    fn failed_playback_retains_the_unplayed_chunk() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("part-000000.wav"), "synthetic fixture").unwrap();
+        fs::write(
+            temp.path().join("speech.progress.json"),
+            r#"{"stage":"done","completed":1,"total":1}"#,
+        )
+        .unwrap();
+        let (send, _) = mpsc::channel();
+        let result = stream_speech_with_player(
+            Command::new("true").args([] as [&str; 0]),
+            temp.path(),
+            &AtomicBool::new(false),
+            &send,
+            |_, _| Ok(Command::new("false")),
+        );
+        assert!(result.is_err());
+        assert!(temp.path().join("part-000000.wav").exists());
+    }
+
+    #[test]
+    fn progress_reports_loading_and_completed_parts() {
+        let progress: SpeechProgress =
+            serde_json::from_str(r#"{"stage":"loading","completed":0,"total":4}"#).unwrap();
+        assert_eq!(progress.message(), "Loading local voice");
+        let progress: SpeechProgress =
+            serde_json::from_str(r#"{"stage":"generating","completed":1,"total":4}"#).unwrap();
+        assert_eq!(
+            progress.message(),
+            "Generating speech locally · 1/4 parts · 25%"
+        );
+    }
+
     #[test]
     fn paste_edit_unicode_and_reload_draft() {
         let temp = tempfile::tempdir().unwrap();

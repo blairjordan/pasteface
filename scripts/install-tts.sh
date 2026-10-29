@@ -5,10 +5,10 @@ root="${HOME}/.local/lib/pasteface/tts"
 mkdir -p "$root/voices"
 if command -v uv >/dev/null 2>&1; then
     test -x "$root/venv/bin/python" || uv venv --python 3.12 "$root/venv"
-    uv pip install --python "$root/venv/bin/python" 'kokoro-onnx==0.6.1'
+    uv pip install --python "$root/venv/bin/python" 'kokoro-onnx==0.6.1' 'pysbd==0.3.4'
 else
     test -x "$root/venv/bin/python" || python3 -m venv "$root/venv"
-    "$root/venv/bin/python" -m pip install 'kokoro-onnx==0.6.1'
+    "$root/venv/bin/python" -m pip install 'kokoro-onnx==0.6.1' 'pysbd==0.3.4'
 fi
 "$root/venv/bin/python" - "$root/voices" <<'PYMODEL'
 from pathlib import Path
