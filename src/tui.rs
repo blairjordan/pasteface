@@ -33,10 +33,23 @@ pub fn run(config: Config) -> Result<()> {
     let mut terminal = ratatui::init();
     crossterm::execute!(
         std::io::stdout(),
+        crossterm::terminal::SetTitle("Pasteface"),
         event::EnableBracketedPaste,
         event::EnableMouseCapture
     )?;
-    let result = interact(&mut terminal, &client, &mut speech);
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handlers = Vec::new();
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGINT,
+    ] {
+        handlers.push(signal_hook::flag::register(signal, shutdown.clone())?);
+    }
+    let result = interact(&mut terminal, &client, &mut speech, &shutdown);
+    for handler in handlers {
+        signal_hook::low_level::unregister(handler);
+    }
     let _ = crossterm::execute!(
         std::io::stdout(),
         event::DisableBracketedPaste,
@@ -115,10 +128,14 @@ fn interact(
     terminal: &mut ratatui::DefaultTerminal,
     client: &Client,
     speech: &mut crate::speech::SpeechView,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let mut view = View::default();
     let mut sampled_at = Instant::now();
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let (state, error) = client.snapshot();
         if state.transcript.is_empty() && !state.phase.busy() {
             view.welcome_started.get_or_insert_with(Instant::now);

@@ -415,6 +415,25 @@ fn vertical_cursor(text: &str, cursor: usize, up: bool) -> usize {
 }
 fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
     ensure!(!canceled.load(Ordering::Acquire), "Playback stopped");
+    // Also stop audio after an abrupt UI death where Rust destructors cannot run.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::other(
+                        "Speech interface exited before playback started",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = command
         .spawn()
         .context("Could not start local speech process")?;
