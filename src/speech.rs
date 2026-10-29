@@ -35,10 +35,18 @@ impl Drop for Playback {
     }
 }
 
+const VOICES: [(&str, &str); 4] = [
+    ("af_heart", "Heart"),
+    ("af_bella", "Bella"),
+    ("am_michael", "Michael"),
+    ("bf_emma", "Emma (British)"),
+];
+
 pub struct SpeechView {
     pub active: bool,
     text: String,
     cursor: usize,
+    voice: usize,
     directory: PathBuf,
     message: String,
     playback: Option<Playback>,
@@ -46,6 +54,8 @@ pub struct SpeechView {
     follow_cursor: bool,
     play_area: Rect,
     stop_area: Rect,
+    voice_area: Rect,
+    generating: bool,
 }
 impl SpeechView {
     pub fn new(directory: PathBuf) -> Self {
@@ -57,7 +67,14 @@ impl SpeechView {
             ),
             Err(e) => (String::new(), format!("Could not load speech draft: {e}")),
         };
+        let saved_voice =
+            fs::read_to_string(directory.join("speech-voice.txt")).unwrap_or_default();
+        let voice = VOICES
+            .iter()
+            .position(|(id, _)| *id == saved_voice.trim())
+            .unwrap_or(0);
         Self {
+            voice,
             active: false,
             cursor: text.len(),
             text,
@@ -68,11 +85,14 @@ impl SpeechView {
             follow_cursor: true,
             play_area: Rect::default(),
             stop_area: Rect::default(),
+            voice_area: Rect::default(),
+            generating: false,
         }
     }
     pub fn stop(&mut self) {
         if let Some(playback) = &self.playback {
             playback.cancel.store(true, Ordering::Release);
+            self.generating = false;
             self.message = "Stopping playback. Your text is retained.".into();
         }
     }
@@ -83,6 +103,7 @@ impl SpeechView {
                 .as_ref()
                 .is_some_and(|worker| worker.is_finished());
             for update in playback.updates.try_iter() {
+                self.generating = false;
                 self.message = update;
             }
             if finished {
@@ -130,14 +151,16 @@ impl SpeechView {
             self.message = "Paste or type some text first.".into();
             return;
         }
+        let voice = VOICES[self.voice].0;
         let text = self.text.clone();
         let root = self.directory.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let canceled = cancel.clone();
         let (send, updates) = mpsc::channel();
-        self.message = "Generating speech locally…".into();
+        self.message = "Generating speech locally".into();
+        self.generating = true;
         let worker = thread::spawn(move || {
-            let result = speak(&root, &text, &canceled, &send);
+            let result = speak(&root, &text, voice, &canceled, &send);
             let message = match result {
                 _ if canceled.load(Ordering::Acquire) => {
                     "Playback stopped. Your text is retained.".into()
@@ -165,6 +188,12 @@ impl SpeechView {
         }
         match event {
             Event::Paste(text) => self.insert(&text),
+            Event::Mouse(mouse)
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && self.voice_area.contains((mouse.column, mouse.row).into()) =>
+            {
+                return self.event(Event::Key(crossterm::event::KeyEvent::from(KeyCode::F(7))));
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)
                     if self.play_area.contains((mouse.column, mouse.row).into()) =>
@@ -185,6 +214,17 @@ impl SpeechView {
                 match key.code {
                     KeyCode::Char('q') if control => return true,
                     KeyCode::F(5) => self.play(),
+                    KeyCode::F(7) => {
+                        self.voice = (self.voice + 1) % VOICES.len();
+                        self.message =
+                            format!("Voice: {}. F5 plays with this voice.", VOICES[self.voice].1);
+                        if let Err(e) = fs::write(
+                            self.directory.join("speech-voice.txt"),
+                            VOICES[self.voice].0,
+                        ) {
+                            self.message = format!("Could not save voice preference: {e}");
+                        }
+                    }
                     KeyCode::Enter if control => self.play(),
                     KeyCode::Esc => self.stop(),
                     KeyCode::Char('v') if control => {
@@ -247,17 +287,12 @@ impl SpeechView {
             Constraint::Length(2),
             Constraint::Min(3),
             Constraint::Length(2),
-            Constraint::Length(3),
+            Constraint::Length(if frame.area().width < 80 { 3 } else { 2 }),
         ])
-        .margin(1)
+        .horizontal_margin(1)
+        .vertical_margin(0)
         .split(frame.area());
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw("[F6] Listen   /   "),
-                Span::styled("Speak", Style::default().fg(Color::Cyan).bold()),
-            ])),
-            rows[0],
-        );
+        mode_bar(frame, true, rows[0]);
         let before = &self.text[..self.cursor];
         if self.follow_cursor {
             let width = rows[1].width.saturating_sub(2).max(1) as usize;
@@ -292,24 +327,61 @@ impl SpeechView {
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll, 0))
                 .block(Block::bordered().title(format!(
-                    "Text to speech · {} words · saved locally",
+                    "Text to speech · {} · {} words",
+                    VOICES[self.voice].1,
                     self.text.split_whitespace().count()
                 ))),
             rows[1],
         );
-        frame.render_widget(
-            Paragraph::new(self.message.as_str()).wrap(Wrap { trim: false }),
-            rows[2],
-        );
-        self.play_area = Rect::new(rows[3].x, rows[3].y, rows[3].width.min(18), 1);
-        self.stop_area = Rect::new(
-            rows[3].x + 19,
+        let message = if self.generating {
+            let label = "Generating speech locally";
+            Line::from(
+                label
+                    .chars()
+                    .enumerate()
+                    .map(|(index, c)| {
+                        let gain = crate::animation::shimmer(index, label.len());
+                        let color = Color::Rgb(
+                            (243. * gain) as u8,
+                            (199. * gain) as u8,
+                            (125. * gain) as u8,
+                        );
+                        Span::styled(c.to_string(), Style::default().fg(color).bold())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            Line::from(self.message.as_str())
+        };
+        frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), rows[2]);
+        self.play_area = Rect::new(rows[3].x, rows[3].y, rows[3].width.min(9), 1);
+        self.voice_area = Rect::new(
+            rows[3].x + 11,
             rows[3].y,
-            rows[3].width.saturating_sub(19).min(10),
+            rows[3].width.saturating_sub(11).min(10),
             1,
         );
-        frame.render_widget(Paragraph::new("[F5] Play          [Esc] Stop\n[Ctrl+V] Paste  [Ctrl+L] Clear text  [F6] Listen  [Ctrl+Q] Close").wrap(Wrap { trim: false }), rows[3]);
+        self.stop_area = Rect::new(
+            rows[3].x + 23,
+            rows[3].y,
+            rows[3].width.saturating_sub(23).min(10),
+            1,
+        );
+        frame.render_widget(Paragraph::new("[F5] Play  [F7] Voice  [Esc] Stop\n[Ctrl+V] Paste  [Ctrl+L] Clear text  [F6] Listen  [Ctrl+Q] Close").wrap(Wrap { trim: false }), rows[3]);
     }
+}
+pub(crate) fn mode_bar(frame: &mut ratatui::Frame, speaking: bool, area: Rect) {
+    let selected = Style::default().fg(Color::Rgb(185, 239, 214)).bold();
+    let normal = Style::default().fg(Color::Rgb(134, 150, 165));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("[F6] "),
+            Span::styled("Listen", if speaking { normal } else { selected }),
+            Span::raw("   /   "),
+            Span::styled("Speak", if speaking { selected } else { normal }),
+        ])),
+        area,
+    );
 }
 fn previous_boundary(text: &str, cursor: usize) -> usize {
     text[..cursor]
@@ -365,6 +437,7 @@ fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
 fn speak(
     root: &Path,
     text: &str,
+    voice: &str,
     canceled: &AtomicBool,
     updates: &mpsc::Sender<String>,
 ) -> Result<()> {
@@ -372,9 +445,10 @@ fn speak(
         .context("Cannot locate home directory")?
         .join(".local/lib/pasteface/tts");
     let python = install.join("venv/bin/python");
-    let model = install.join("voices/en_US-lessac-medium.onnx");
+    let voices = install.join("voices");
+    let model = voices.join("kokoro-v1.0.onnx");
     ensure!(
-        python.is_file() && model.is_file(),
+        python.is_file() && model.is_file() && voices.join("voices-v1.0.bin").is_file(),
         "Local voice is not installed. Run scripts/install-tts.sh from the Pasteface repository."
     );
     let directory = root.join("speech").join(format!(
@@ -394,9 +468,9 @@ fn speak(
     let audio = directory.join("speech.wav");
     wait(
         Command::new(python)
-            .args(["-m", "piper", "-m"])
-            .arg(model)
-            .arg("-f")
+            .args(["-c", include_str!("../scripts/synthesize.py")])
+            .arg(voices)
+            .arg(voice)
             .arg(&audio)
             .stdin(File::open(input)?)
             .stdout(Stdio::null())
@@ -447,6 +521,17 @@ mod tests {
         assert_eq!(SpeechView::new(temp.path().into()).text, view.text);
         assert_eq!(vertical_cursor("ab\n世界\nz", 9, true), 2);
     }
+    #[test]
+    fn selected_voice_survives_restart_without_changing_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut view = SpeechView::new(temp.path().into());
+        view.event(Event::Paste("Keep this draft".into()));
+        view.event(Event::Key(KeyEvent::from(KeyCode::F(7))));
+        let restored = SpeechView::new(temp.path().into());
+        assert_eq!(VOICES[restored.voice].0, "af_bella");
+        assert_eq!(restored.text, "Keep this draft");
+    }
+
     #[test]
     fn cancellation_kills_and_reaps_child() {
         let canceled = Arc::new(AtomicBool::new(false));

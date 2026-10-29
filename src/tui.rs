@@ -165,7 +165,7 @@ fn interact(
         if event::poll(Duration::from_millis(if revealing { 32 } else { 80 }))? {
             let event = event::read()?;
             let toggle = matches!(&event, Event::Key(key) if key.code == KeyCode::F(6) && key.kind == KeyEventKind::Press)
-                || matches!(&event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && mouse.row == u16::from(speech.active) && mouse.column < 30);
+                || matches!(&event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && mouse.row == 0 && mouse.column < 30);
             if toggle
                 && view.settings.is_none()
                 && view.tab_menu.is_none()
@@ -477,7 +477,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     .horizontal_margin(1)
     .vertical_margin(0)
     .split(frame.area());
-    frame.render_widget(Paragraph::new("[F6] Listen   /   Speak").fg(MINT), rows[0]);
+    crate::speech::mode_bar(frame, false, rows[0]);
     let rows = &rows[1..];
     view.transcript_area = Rect::new(
         rows[1].x,
@@ -1057,6 +1057,41 @@ fn microphone_picker(
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn switching_modes_keeps_header_and_text_baselines() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let state = State {
+            transcript: "Listen baseline".into(),
+            ..State::default()
+        };
+        let mut view = View::default();
+        terminal
+            .draw(|frame| draw(frame, &state, None, &mut view))
+            .unwrap();
+        let position = |buffer: &ratatui::buffer::Buffer, needle: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let row: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    row.find(needle).map(|x| (x, y))
+                })
+                .unwrap()
+        };
+        let header = position(terminal.backend().buffer(), "[F6]");
+        let listen = position(terminal.backend().buffer(), "Listen baseline");
+        let mut speech = crate::speech::SpeechView::new(temp.path().into());
+        speech.event(Event::Paste("Speak baseline".into()));
+        terminal.draw(|frame| speech.draw(frame)).unwrap();
+        assert_eq!(position(terminal.backend().buffer(), "[F6]"), header);
+        // The editor border occupies one horizontal cell; text starts on the same row.
+        assert_eq!(
+            position(terminal.backend().buffer(), "Speak baseline").1,
+            listen.1
+        );
+    }
+
     #[test]
     fn completed_queue_items_fade_without_removing_transcripts() {
         let mut state = State::default();
