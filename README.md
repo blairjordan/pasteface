@@ -185,3 +185,11 @@ cargo check --no-default-features
 ```
 
 Tests use isolated recording fixtures and mock HTTP responses. They do not record from your microphone or upload your audio to OpenAI.
+
+### ALSA capture recovery
+
+The audio backend recovers buffer overruns and supported suspend/resume events
+without ending the recording. An overrun can leave a gap in captured audio.
+Device disconnections and failed recovery still stop capture and retain the
+recording for retry. Rebuild and reinstall after updating; restart the idle
+app and recorder so drun uses the updated binary.

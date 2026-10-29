@@ -24,7 +24,11 @@ pub struct Capture {
 pub fn devices() -> Result<Vec<String>> {
     cpal::default_host()
         .input_devices()?
-        .map(|d| d.name().map_err(Into::into))
+        .map(|d| {
+            d.description()
+                .map(|d| d.name().to_owned())
+                .map_err(Into::into)
+        })
         .collect()
 }
 impl Capture {
@@ -32,19 +36,19 @@ impl Capture {
         let host = cpal::default_host();
         let device = if let Some(name) = name {
             host.input_devices()?
-                .find(|d| d.name().is_ok_and(|n| n == name))
+                .find(|d| d.description().is_ok_and(|d| d.name() == name))
         } else {
             host.default_input_device()
         }
         .context("Microphone not found. Run `pasteface devices` and set AUDIO_DEVICE.")?;
-        let device_name = device.name()?;
+        let device_name = device.description()?.name().to_owned();
         let supported = device.default_input_config()?;
-        let config: cpal::StreamConfig = supported.clone().into();
+        let config: cpal::StreamConfig = supported.into();
         let writer = Arc::new(Mutex::new(Some(hound::WavWriter::create(
             path,
             hound::WavSpec {
                 channels: 1,
-                sample_rate: config.sample_rate.0,
+                sample_rate: config.sample_rate,
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             },
@@ -96,7 +100,7 @@ where
     let stream_error = error.clone();
     let channels = config.channels as usize;
     Ok(device.build_input_stream(
-        config,
+        *config,
         move |data: &[T], _| {
             let mut guard = writer.lock().unwrap();
             let Some(writer) = guard.as_mut() else {
@@ -116,7 +120,7 @@ where
             level.store(peak.to_bits(), Ordering::Relaxed);
         },
         move |e| {
-            *stream_error.lock().unwrap() = Some(e.to_string());
+            record_stream_error(&stream_error, e);
         },
         None,
     )?)
@@ -126,4 +130,29 @@ where
 pub fn duration(path: &Path) -> Result<f64> {
     let wav = hound::WavReader::open(path)?;
     Ok(f64::from(wav.duration()) / f64::from(wav.spec().sample_rate))
+}
+
+// CPAL recovers xruns by preparing and restarting capture. A later recovery
+// failure is delivered separately and must still stop capture.
+fn record_stream_error(error: &Arc<Mutex<Option<String>>>, event: cpal::Error) {
+    if event.kind() != cpal::ErrorKind::Xrun {
+        *error.lock().unwrap() = Some(event.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recoverable_overrun_does_not_abort_capture_but_disconnect_does() {
+        let error = Arc::new(Mutex::new(None));
+        record_stream_error(&error, cpal::ErrorKind::Xrun.into());
+        assert!(error.lock().unwrap().is_none());
+        record_stream_error(&error, cpal::ErrorKind::DeviceNotAvailable.into());
+        let fatal = error.lock().unwrap().clone();
+        assert!(fatal.is_some());
+        record_stream_error(&error, cpal::ErrorKind::Xrun.into());
+        assert_eq!(*error.lock().unwrap(), fatal);
+    }
 }

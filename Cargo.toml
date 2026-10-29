@@ -14,7 +14,7 @@ tray = ["dep:tray-icon", "dep:gtk", "dep:tao"]
 anyhow = "1"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 clap = { version = "4", features = ["derive"] }
-cpal = "0.16"
+cpal = "0.18.2"
 crossterm = "0.29"
 dirs = "6"
 fs2 = "0.4"

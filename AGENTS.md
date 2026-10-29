@@ -49,3 +49,7 @@ Do not bypass the hook. Keep unrelated work out of a commit. Never include secre
 CI runs these checks on Linux and macOS. Socket tests need an environment that permits local Unix and TCP sockets; sandbox denials are not evidence of broken application behavior.
 
 If a .codegraph directory exists, use CodeGraph before searching or reading code to locate symbols. Do not create an index without the user's request.
+
+## Local installation
+
+The user launches Pasteface through drun. After changes pass validation, build and install the latest release to `~/.local/bin/pasteface`, verify the desktop entry points there, and restart idle background and UI processes so the installed update is actually running. Preserve recordings and transcript state; never stop active capture or transcription to upgrade.
