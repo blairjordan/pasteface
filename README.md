@@ -153,6 +153,8 @@ See the official [file transcription guide](https://developers.openai.com/api/do
 
 Capture uses the selected microphone's native sample rate. After stopping, FFmpeg converts the recording to mono 16 kHz PCM. Each chunk is transcribed as a complete recording. Text appears when the chunk finishes; live partial transcripts are not currently displayed.
 
+Local Whisper decodes audio windows without reusing earlier generated text (`--max-context 0`) to reduce repeated-phrase loops in longer recordings. This reduces one source of repetition but cannot prevent every model hallucination.
+
 ## Configuration and storage
 
 State is stored in a private application directory: normally `~/.local/state/pasteface` on Linux or the platform application-data directory on macOS. It contains `transcription.json`, the optional `secrets.json`, recorded chunks, processing logs, and the combined transcript.
