@@ -22,26 +22,45 @@ pub struct Capture {
     pub device: String,
 }
 pub fn devices() -> Result<Vec<String>> {
-    cpal::default_host()
-        .input_devices()?
-        .map(|d| {
-            d.description()
-                .map(|d| d.name().to_owned())
-                .map_err(Into::into)
-        })
-        .collect()
+    let mut names = Vec::new();
+    for device in cpal::default_host().input_devices()? {
+        let description = device.description()?;
+        let name = microphone_name(description.name());
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+// ALSA descriptions append a PCM description (e.g. ", USB Audio"). Keep
+// existing saved card names compatible while trying usable PCM endpoints.
+fn microphone_name(description: &str) -> &str {
+    #[cfg(target_os = "linux")]
+    {
+        description
+            .split_once(", ")
+            .map_or(description, |(name, _)| name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        description
+    }
 }
 impl Capture {
     pub fn start(path: &Path, name: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
         let device = if let Some(name) = name {
-            host.input_devices()?
-                .find(|d| d.description().is_ok_and(|d| d.name() == name))
+            host.input_devices()?.find(|d| {
+                d.description().is_ok_and(|description| {
+                    (description.name() == name || microphone_name(description.name()) == name)
+                        && d.default_input_config().is_ok()
+                })
+            })
         } else {
             host.default_input_device()
         }
         .context("Microphone not found. Run `pasteface devices` and set AUDIO_DEVICE.")?;
-        let device_name = device.description()?.name().to_owned();
+        let device_name = microphone_name(device.description()?.name()).to_owned();
         let supported = device.default_input_config()?;
         let config: cpal::StreamConfig = supported.into();
         let writer = Arc::new(Mutex::new(Some(hound::WavWriter::create(
@@ -143,6 +162,20 @@ fn record_stream_error(error: &Arc<Mutex<Option<String>>>, event: cpal::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn saved_card_names_match_new_alsa_descriptions() {
+        assert_eq!(
+            microphone_name("Razer Kiyo Pro, USB Audio"),
+            "Razer Kiyo Pro"
+        );
+        assert_eq!(
+            microphone_name("HyperX QuadCast S, USB Audio"),
+            "HyperX QuadCast S"
+        );
+        assert_eq!(microphone_name("pipewire"), "pipewire");
+    }
 
     #[test]
     fn recoverable_overrun_does_not_abort_capture_but_disconnect_does() {
