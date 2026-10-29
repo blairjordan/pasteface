@@ -61,11 +61,10 @@ pub struct SpeechView {
 impl SpeechView {
     pub fn new(directory: PathBuf) -> Self {
         let (text, message) = match fs::read_to_string(directory.join("speech-draft.txt")) {
-            Ok(text) => (text, "Paste or type text, then press F5 to play.".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-                String::new(),
-                "Paste or type text, then press F5 to play.".into(),
-            ),
+            Ok(text) => (text, "Paste or type text to read aloud.".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (String::new(), "Paste or type text to read aloud.".into())
+            }
             Err(e) => (String::new(), format!("Could not load speech draft: {e}")),
         };
         let saved_voice =
@@ -149,7 +148,6 @@ impl SpeechView {
     }
     fn play(&mut self) {
         if self.playback.is_some() {
-            self.message = "Press Esc to stop before playing again.".into();
             return;
         }
         if self.text.trim().is_empty() {
@@ -171,7 +169,7 @@ impl SpeechView {
                 _ if canceled.load(Ordering::Acquire) => {
                     "Playback stopped. Your text is retained.".into()
                 }
-                Ok(()) => "Finished. F5 plays again.".into(),
+                Ok(()) => "Finished.".into(),
                 Err(error) => format!("{error:#}"),
             };
             let _ = send.send(message);
@@ -339,47 +337,65 @@ impl SpeechView {
                 ))),
             rows[1],
         );
-        let message = if self.generating {
-            let label = format!(
-                "{} · {}s elapsed · Esc stops",
-                self.message,
-                self.generation_started
-                    .map_or(0, |started| started.elapsed().as_secs())
-            );
-            Line::from(
-                label
-                    .chars()
-                    .enumerate()
-                    .map(|(index, c)| {
-                        let gain = crate::animation::shimmer(index, label.len());
-                        let color = Color::Rgb(
+        let elapsed = self.generating.then(|| {
+            self.generation_started
+                .map_or(0, |started| started.elapsed().as_secs())
+        });
+        frame.render_widget(
+            Paragraph::new(speech_status(&self.message, self.generating, elapsed))
+                .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+        let busy = self.playback.is_some();
+        let primary = if busy {
+            "[Esc] ■ Stop"
+        } else {
+            "[F5] ▶ Play"
+        };
+        let primary_width = Line::from(primary).width() as u16;
+        let primary_area = Rect::new(rows[3].x, rows[3].y, rows[3].width.min(primary_width), 1);
+        self.play_area = if busy { Rect::default() } else { primary_area };
+        self.stop_area = if busy { primary_area } else { Rect::default() };
+        let voice_offset = primary_width + 2;
+        self.voice_area = Rect::new(
+            rows[3].x + voice_offset,
+            rows[3].y,
+            rows[3].width.saturating_sub(voice_offset).min(10),
+            1,
+        );
+        frame.render_widget(Paragraph::new(format!("{primary}  [F7] Voice\n[Ctrl+V] Paste  [Ctrl+L] Clear text  [F6] Listen  [Ctrl+Q] Close")).wrap(Wrap { trim: false }), rows[3]);
+    }
+}
+fn speech_status(message: &str, generating: bool, elapsed: Option<u64>) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, part) in message.split(" · ").enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" · "));
+        }
+        let shimmer =
+            generating && (part.starts_with("Generating") || part.starts_with("generating"));
+        if shimmer {
+            spans.extend(part.chars().enumerate().map(|(index, c)| {
+                let gain = crate::animation::shimmer(index, part.len());
+                Span::styled(
+                    c.to_string(),
+                    Style::default()
+                        .fg(Color::Rgb(
                             (243. * gain) as u8,
                             (199. * gain) as u8,
                             (125. * gain) as u8,
-                        );
-                        Span::styled(c.to_string(), Style::default().fg(color).bold())
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                        ))
+                        .bold(),
+                )
+            }));
         } else {
-            Line::from(self.message.as_str())
-        };
-        frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), rows[2]);
-        self.play_area = Rect::new(rows[3].x, rows[3].y, rows[3].width.min(9), 1);
-        self.voice_area = Rect::new(
-            rows[3].x + 11,
-            rows[3].y,
-            rows[3].width.saturating_sub(11).min(10),
-            1,
-        );
-        self.stop_area = Rect::new(
-            rows[3].x + 23,
-            rows[3].y,
-            rows[3].width.saturating_sub(23).min(10),
-            1,
-        );
-        frame.render_widget(Paragraph::new("[F5] Play  [F7] Voice  [Esc] Stop\n[Ctrl+V] Paste  [Ctrl+L] Clear text  [F6] Listen  [Ctrl+Q] Close").wrap(Wrap { trim: false }), rows[3]);
+            spans.push(Span::raw(part.to_owned()));
+        }
     }
+    if let Some(seconds) = elapsed {
+        spans.push(Span::raw(format!(" · {seconds}s elapsed")));
+    }
+    Line::from(spans)
 }
 pub(crate) fn mode_bar(frame: &mut ratatui::Frame, speaking: bool, area: Rect) {
     let selected = Style::default().fg(Color::Rgb(185, 239, 214)).bold();
@@ -571,12 +587,7 @@ fn stream_speech_with_player(
                 } else {
                     " · all audio ready".into()
                 };
-                format!(
-                    "Playing part {}/{}{} · Esc stops",
-                    next + 1,
-                    progress.total,
-                    generating
-                )
+                format!("Playing part {}/{}{}", next + 1, progress.total, generating)
             } else if next > 0 && !finished {
                 format!("Buffering part {} · {}", next + 1, progress.message())
             } else {
@@ -653,6 +664,71 @@ fn speak(
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    #[test]
+    fn controls_show_only_the_action_available_in_the_current_state() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let temp = tempfile::tempdir().unwrap();
+        let mut view = SpeechView::new(temp.path().into());
+        let render = |view: &mut SpeechView| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|frame| view.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..24)
+                .map(|y| {
+                    (0..100)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let idle = render(&mut view);
+        assert!(idle.contains("[F5] ▶ Play"));
+        assert!(!idle.contains("[Esc]"));
+        assert_eq!(view.stop_area, Rect::default());
+        let (send, updates) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        view.playback = Some(Playback {
+            cancel: cancel.clone(),
+            updates,
+            worker: None,
+        });
+        view.message = "Playing part 5/61 · generating 14/61".into();
+        view.generating = true;
+        let playing = render(&mut view);
+        assert!(playing.contains("[Esc] ■ Stop"));
+        assert_eq!(playing.matches("[Esc]").count(), 1);
+        assert!(!playing.contains("[F5]"));
+        assert_eq!(view.play_area, Rect::default());
+        view.event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: view.stop_area.x,
+            row: view.stop_area.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(cancel.load(Ordering::Acquire));
+        drop(send);
+    }
+
+    #[test]
+    fn shimmer_only_styles_the_generation_segment() {
+        let line = speech_status("Playing part 5/61 · generating 14/61", true, Some(65));
+        let animated: String = line
+            .spans
+            .iter()
+            .filter(|span| span.style.fg.is_some())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(animated, "generating 14/61");
+        let all: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(all, "Playing part 5/61 · generating 14/61 · 65s elapsed");
+        assert!(!all.contains("Esc"));
+    }
+
     #[test]
     fn first_chunk_plays_before_synthesis_finishes_and_played_files_are_deleted() {
         let temp = tempfile::tempdir().unwrap();
