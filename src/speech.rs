@@ -1,0 +1,461 @@
+use anyhow::{Context, Result, bail, ensure};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Paragraph, Wrap},
+};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+struct Playback {
+    cancel: Arc<AtomicBool>,
+    updates: mpsc::Receiver<String>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+impl Drop for Playback {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub struct SpeechView {
+    pub active: bool,
+    text: String,
+    cursor: usize,
+    directory: PathBuf,
+    message: String,
+    playback: Option<Playback>,
+    scroll: u16,
+    follow_cursor: bool,
+    play_area: Rect,
+    stop_area: Rect,
+}
+impl SpeechView {
+    pub fn new(directory: PathBuf) -> Self {
+        let (text, message) = match fs::read_to_string(directory.join("speech-draft.txt")) {
+            Ok(text) => (text, "Paste or type text, then press F5 to play.".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                String::new(),
+                "Paste or type text, then press F5 to play.".into(),
+            ),
+            Err(e) => (String::new(), format!("Could not load speech draft: {e}")),
+        };
+        Self {
+            active: false,
+            cursor: text.len(),
+            text,
+            directory,
+            message,
+            playback: None,
+            scroll: 0,
+            follow_cursor: true,
+            play_area: Rect::default(),
+            stop_area: Rect::default(),
+        }
+    }
+    pub fn stop(&mut self) {
+        if let Some(playback) = &self.playback {
+            playback.cancel.store(true, Ordering::Release);
+            self.message = "Stopping playback. Your text is retained.".into();
+        }
+    }
+    pub fn tick(&mut self) {
+        if let Some(playback) = &self.playback {
+            let finished = playback
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished());
+            for update in playback.updates.try_iter() {
+                self.message = update;
+            }
+            if finished {
+                self.playback = None;
+            }
+        }
+    }
+    fn save(&mut self) {
+        let result = (|| -> Result<()> {
+            let temp = self.directory.join("speech-draft.tmp");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temp)?;
+            file.write_all(self.text.as_bytes())?;
+            fs::rename(temp, self.directory.join("speech-draft.txt"))?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.message = format!("Could not save draft: {error}");
+        }
+    }
+    fn insert(&mut self, text: &str) {
+        // Keep terminal control characters out of rendered drafts.
+        let text: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect();
+        self.text.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+        self.scroll = 0;
+        self.follow_cursor = true;
+        self.save();
+    }
+    fn play(&mut self) {
+        if self.playback.is_some() {
+            self.message = "Press Esc to stop before playing again.".into();
+            return;
+        }
+        if self.text.trim().is_empty() {
+            self.message = "Paste or type some text first.".into();
+            return;
+        }
+        let text = self.text.clone();
+        let root = self.directory.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let canceled = cancel.clone();
+        let (send, updates) = mpsc::channel();
+        self.message = "Generating speech locally…".into();
+        let worker = thread::spawn(move || {
+            let result = speak(&root, &text, &canceled, &send);
+            let message = match result {
+                _ if canceled.load(Ordering::Acquire) => {
+                    "Playback stopped. Your text is retained.".into()
+                }
+                Ok(()) => "Finished. F5 plays again.".into(),
+                Err(error) => format!("{error:#}"),
+            };
+            let _ = send.send(message);
+        });
+        self.playback = Some(Playback {
+            cancel,
+            updates,
+            worker: Some(worker),
+        });
+    }
+    // Returns true only for an explicit close shortcut; ordinary letters edit text.
+    pub fn event(&mut self, event: Event) -> bool {
+        if matches!(&event, Event::Key(_)) {
+            self.follow_cursor = true;
+        }
+        if matches!(&event, Event::Mouse(_))
+            || matches!(&event, Event::Key(key) if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
+        {
+            self.follow_cursor = false;
+        }
+        match event {
+            Event::Paste(text) => self.insert(&text),
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.play_area.contains((mouse.column, mouse.row).into()) =>
+                {
+                    self.play()
+                }
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.stop_area.contains((mouse.column, mouse.row).into()) =>
+                {
+                    self.stop()
+                }
+                MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_add(3),
+                _ => {}
+            },
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Char('q') if control => return true,
+                    KeyCode::F(5) => self.play(),
+                    KeyCode::Enter if control => self.play(),
+                    KeyCode::Esc => self.stop(),
+                    KeyCode::Char('v') if control => {
+                        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                            Ok(text) => self.insert(&text),
+                            Err(e) => {
+                                self.message = format!(
+                                    "Clipboard unavailable: {e}. Try terminal paste (Ctrl+Shift+V)."
+                                )
+                            }
+                        }
+                    }
+                    KeyCode::Char('l') if control => {
+                        self.text.clear();
+                        self.cursor = 0;
+                        self.scroll = 0;
+                        self.save();
+                    }
+                    KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        self.insert(&c.to_string())
+                    }
+                    KeyCode::Enter => self.insert("\n"),
+                    KeyCode::Tab => self.insert("\t"),
+                    KeyCode::Left => self.cursor = previous_boundary(&self.text, self.cursor),
+                    KeyCode::Right => self.cursor = next_boundary(&self.text, self.cursor),
+                    KeyCode::Home => {
+                        self.cursor = self.text[..self.cursor].rfind('\n').map_or(0, |p| p + 1)
+                    }
+                    KeyCode::End => {
+                        self.cursor += self.text[self.cursor..]
+                            .find('\n')
+                            .unwrap_or(self.text.len() - self.cursor)
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        self.cursor =
+                            vertical_cursor(&self.text, self.cursor, key.code == KeyCode::Up)
+                    }
+                    KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+                    KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+                    KeyCode::Backspace if self.cursor > 0 => {
+                        let start = previous_boundary(&self.text, self.cursor);
+                        self.text.drain(start..self.cursor);
+                        self.cursor = start;
+                        self.save();
+                    }
+                    KeyCode::Delete if self.cursor < self.text.len() => {
+                        let end = next_boundary(&self.text, self.cursor);
+                        self.text.drain(self.cursor..end);
+                        self.save();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+    pub fn draw(&mut self, frame: &mut ratatui::Frame) {
+        let rows = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+            Constraint::Length(3),
+        ])
+        .margin(1)
+        .split(frame.area());
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("[F6] Listen   /   "),
+                Span::styled("Speak", Style::default().fg(Color::Cyan).bold()),
+            ])),
+            rows[0],
+        );
+        let before = &self.text[..self.cursor];
+        if self.follow_cursor {
+            let width = rows[1].width.saturating_sub(2).max(1) as usize;
+            let cursor_row = before
+                .split('\n')
+                .map(|line| line.chars().count() / width + 1)
+                .sum::<usize>()
+                .saturating_sub(1)
+                .min(u16::MAX as usize) as u16;
+            let height = rows[1].height.saturating_sub(2).max(1);
+            if cursor_row < self.scroll {
+                self.scroll = cursor_row;
+            }
+            if cursor_row >= self.scroll.saturating_add(height) {
+                self.scroll = cursor_row.saturating_sub(height - 1);
+            }
+        }
+        let after = &self.text[self.cursor..];
+        let mut lines: Vec<Line> = before
+            .split('\n')
+            .map(|s| Line::from(s.to_owned()))
+            .collect();
+        let line = lines.last_mut().unwrap();
+        line.spans
+            .push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+        let mut rest = after.split('\n');
+        line.spans
+            .push(Span::raw(rest.next().unwrap_or_default().to_owned()));
+        lines.extend(rest.map(|s| Line::from(s.to_owned())));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll, 0))
+                .block(Block::bordered().title(format!(
+                    "Text to speech · {} words · saved locally",
+                    self.text.split_whitespace().count()
+                ))),
+            rows[1],
+        );
+        frame.render_widget(
+            Paragraph::new(self.message.as_str()).wrap(Wrap { trim: false }),
+            rows[2],
+        );
+        self.play_area = Rect::new(rows[3].x, rows[3].y, rows[3].width.min(18), 1);
+        self.stop_area = Rect::new(
+            rows[3].x + 19,
+            rows[3].y,
+            rows[3].width.saturating_sub(19).min(10),
+            1,
+        );
+        frame.render_widget(Paragraph::new("[F5] Play          [Esc] Stop\n[Ctrl+V] Paste  [Ctrl+L] Clear text  [F6] Listen  [Ctrl+Q] Close").wrap(Wrap { trim: false }), rows[3]);
+    }
+}
+fn previous_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(i, _)| i)
+}
+fn next_boundary(text: &str, cursor: usize) -> usize {
+    cursor + text[cursor..].chars().next().map_or(0, char::len_utf8)
+}
+fn vertical_cursor(text: &str, cursor: usize, up: bool) -> usize {
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let column = text[start..cursor].chars().count();
+    let target = if up {
+        if start == 0 {
+            return cursor;
+        }
+        text[..start - 1].rfind('\n').map_or(0, |i| i + 1)
+    } else {
+        let Some(end) = text[cursor..].find('\n') else {
+            return cursor;
+        };
+        cursor + end + 1
+    };
+    let line = text[target..].split('\n').next().unwrap_or_default();
+    target
+        + line
+            .char_indices()
+            .nth(column)
+            .map_or(line.len(), |(i, _)| i)
+}
+fn wait(command: &mut Command, canceled: &AtomicBool) -> Result<()> {
+    ensure!(!canceled.load(Ordering::Acquire), "Playback stopped");
+    let mut child = command
+        .spawn()
+        .context("Could not start local speech process")?;
+    loop {
+        if canceled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Playback stopped");
+        }
+        if let Some(status) = child.try_wait()? {
+            ensure!(
+                status.success(),
+                "Local speech process exited with {status}"
+            );
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+fn speak(
+    root: &Path,
+    text: &str,
+    canceled: &AtomicBool,
+    updates: &mpsc::Sender<String>,
+) -> Result<()> {
+    let install = dirs::home_dir()
+        .context("Cannot locate home directory")?
+        .join(".local/lib/pasteface/tts");
+    let python = install.join("venv/bin/python");
+    let model = install.join("voices/en_US-lessac-medium.onnx");
+    ensure!(
+        python.is_file() && model.is_file(),
+        "Local voice is not installed. Run scripts/install-tts.sh from the Pasteface repository."
+    );
+    let directory = root.join("speech").join(format!(
+        "{}-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory)?;
+    let input = directory.join("text.txt");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&input)?;
+    file.write_all(text.as_bytes())?;
+    drop(file);
+    let audio = directory.join("speech.wav");
+    wait(
+        Command::new(python)
+            .args(["-m", "piper", "-m"])
+            .arg(model)
+            .arg("-f")
+            .arg(&audio)
+            .stdin(File::open(input)?)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(directory.join("synthesis.log"))?)),
+        canceled,
+    )
+    .context(
+        "Speech synthesis failed; see the retained speech/synthesis.log in the state directory",
+    )?;
+    let _ = updates.send("Playing aloud · Esc stops playback".into());
+    #[cfg(target_os = "macos")]
+    let mut player = {
+        let mut c = Command::new("afplay");
+        c.arg(&audio);
+        c
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut player = {
+        let mut c = Command::new("ffplay");
+        c.args(["-nodisp", "-autoexit", "-loglevel", "error"])
+            .arg(&audio);
+        c
+    };
+    wait(
+        player
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(directory.join("playback.log"))?)),
+        canceled,
+    )
+    .context("Audio playback failed; install ffplay (ffmpeg) and check your output device")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    #[test]
+    fn paste_edit_unicode_and_reload_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut view = SpeechView::new(temp.path().into());
+        view.event(Event::Paste("hello\r\n世界".into()));
+        view.event(Event::Key(KeyEvent::from(KeyCode::Backspace)));
+        assert_eq!(view.text, "hello\n世");
+        view.event(Event::Key(KeyEvent::from(KeyCode::Left)));
+        view.event(Event::Key(KeyEvent::from(KeyCode::Char('q'))));
+        assert_eq!(view.text, "hello\nq世");
+        assert_eq!(SpeechView::new(temp.path().into()).text, view.text);
+        assert_eq!(vertical_cursor("ab\n世界\nz", 9, true), 2);
+    }
+    #[test]
+    fn cancellation_kills_and_reaps_child() {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let flag = canceled.clone();
+        let started = std::time::Instant::now();
+        let worker = thread::spawn(move || wait(Command::new("sleep").arg("30"), &flag));
+        thread::sleep(Duration::from_millis(50));
+        canceled.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}

@@ -28,6 +28,7 @@ const MINT: Color = Color::Rgb(185, 239, 214);
 pub fn run(config: Config) -> Result<()> {
     // The interface owns its dark palette, including under inherited NO_COLOR.
     crossterm::style::force_color_output(true);
+    let mut speech = crate::speech::SpeechView::new(config.directory.clone());
     let client = Client::new(config);
     let mut terminal = ratatui::init();
     crossterm::execute!(
@@ -35,7 +36,7 @@ pub fn run(config: Config) -> Result<()> {
         event::EnableBracketedPaste,
         event::EnableMouseCapture
     )?;
-    let result = interact(&mut terminal, &client);
+    let result = interact(&mut terminal, &client, &mut speech);
     let _ = crossterm::execute!(
         std::io::stdout(),
         event::DisableBracketedPaste,
@@ -110,7 +111,11 @@ fn fade(color: Color, opacity: f32) -> Color {
     Color::Rgb(blend(r, 18), blend(g, 23), blend(b, 30))
 }
 
-fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<()> {
+fn interact(
+    terminal: &mut ratatui::DefaultTerminal,
+    client: &Client,
+    speech: &mut crate::speech::SpeechView,
+) -> Result<()> {
     let mut view = View::default();
     let mut sampled_at = Instant::now();
     loop {
@@ -142,12 +147,40 @@ fn interact(terminal: &mut ratatui::DefaultTerminal, client: &Client) -> Result<
             .iter()
             .position(|tab| tab.id == state.selected_tab)
             .unwrap_or(0);
-        terminal.draw(|f| draw(f, &state, error.as_deref(), &mut view))?;
+        speech.tick();
+        terminal.draw(|f| {
+            if speech.active {
+                f.render_widget(
+                    Block::default().style(Style::default().bg(BG).fg(Color::Rgb(234, 239, 242))),
+                    f.area(),
+                );
+                speech.draw(f);
+            } else {
+                draw(f, &state, error.as_deref(), &mut view);
+            }
+        })?;
         let revealing = view
             .welcome_started
             .is_some_and(|start| start.elapsed() < Duration::from_secs(2));
         if event::poll(Duration::from_millis(if revealing { 32 } else { 80 }))? {
             let event = event::read()?;
+            let toggle = matches!(&event, Event::Key(key) if key.code == KeyCode::F(6) && key.kind == KeyEventKind::Press)
+                || matches!(&event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) && mouse.row == u16::from(speech.active) && mouse.column < 30);
+            if toggle
+                && view.settings.is_none()
+                && view.tab_menu.is_none()
+                && view.microphone.is_none()
+            {
+                speech.stop();
+                speech.active = !speech.active;
+                continue;
+            }
+            if speech.active {
+                if speech.event(event) {
+                    break;
+                }
+                continue;
+            }
             if let Some(menu) = &mut view.tab_menu {
                 let (close, action) = menu.event(event, terminal.get_frame().area());
                 if let Some(action) = action {
@@ -431,6 +464,7 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     let queue_items = queue_items(state, &mut view.completed, Instant::now());
     let rows = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(4),
         Constraint::Length(if state.phase == Phase::Recording {
             7
@@ -443,6 +477,8 @@ fn draw(frame: &mut ratatui::Frame, state: &State, error: Option<&str>, view: &m
     .horizontal_margin(1)
     .vertical_margin(0)
     .split(frame.area());
+    frame.render_widget(Paragraph::new("[F6] Listen   /   Speak").fg(MINT), rows[0]);
+    let rows = &rows[1..];
     view.transcript_area = Rect::new(
         rows[1].x,
         rows[1].y + 1,

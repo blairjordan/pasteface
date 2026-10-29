@@ -10,6 +10,7 @@ mod provider;
 mod selection;
 mod service;
 mod settings_ui;
+mod speech;
 mod tab_menu;
 mod transcribe;
 #[cfg(feature = "tray")]

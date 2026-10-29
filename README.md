@@ -195,3 +195,28 @@ without ending the recording. An overrun can leave a gap in captured audio.
 Device disconnections and failed recovery still stop capture and retain the
 recording for retry. Rebuild and reinstall after updating; restart the idle
 app and recorder so drun uses the updated binary.
+
+### Text to speech (local and free)
+
+Press **F6** or click the mode bar to switch between **Listen** (speech to text)
+and **Speak** (text to speech). Speak has a separate editable draft, which is
+saved locally and does not alter recorded transcripts.
+
+- Paste a block with **Ctrl+V** or your terminal's paste shortcut, or type text.
+- **F5** plays the text aloud using Piper and an English Lessac voice.
+- **Esc** stops synthesis or playback; **F6** stops playback and returns to Listen.
+- Arrow keys, Home/End, Backspace/Delete, and Enter edit the draft.
+- **Ctrl+L** clears the draft; **Ctrl+Q** closes the speech interface.
+- Listen keeps its existing shortcuts, including **Q** to close.
+
+Install the local engine and voice once with `scripts/install-tts.sh` (requires
+Python or uv and an internet connection for installation). Linux playback uses
+`ffplay` from FFmpeg; macOS uses `afplay`. After setup, synthesis and playback run
+offline without an account or paid API. Piper is GPL-3.0; the downloaded Lessac
+voice includes its upstream model metadata. Generated WAVs and speech input text
+are retained under the state directory's `speech/` folder. Closing or switching
+modes stops playback; microphone capture continues independently in the daemon.
+
+Launch the installed app with `~/.local/bin/pasteface tui --no-tray`. Closing the
+interface leaves the recorder running; `~/.local/bin/pasteface shutdown` stops
+an idle recorder. Rebuild and install changes with `scripts/install-linux.sh`.
